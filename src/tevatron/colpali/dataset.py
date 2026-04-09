@@ -1,18 +1,13 @@
 import logging
-import os
 import random
-from dataclasses import dataclass
 from pathlib import Path
-from pdb import set_trace as st
-from pprint import pformat, pprint
-from typing import List, Tuple
 
 import msgspec
-from arguments import DataArguments
 from datasets import load_dataset
 from msgspec.json import format
-from tevatron.retriever.arguments import DataArguments
+from tevatron.colpali.arguments import DataArguments
 from torch.utils.data import Dataset
+from pdb import set_trace as st
 
 encoder = msgspec.json.Encoder()
 decoder = msgspec.json.Decoder()
@@ -92,6 +87,71 @@ class TrainDataset(Dataset):
         except Exception as e:
             print(e)
             
+        """
+        https://discuss.huggingface.co/t/from-pandas-dataframe-to-huggingface-dataset/9322/3
+        import pandas as pd
+        import datasets
+        from datasets import Dataset, DatasetDict
+
+
+        tdf = pd.DataFrame({"a": [1, 2, 3], "b": ['hello', 'ola', 'thammi']})
+        vdf = pd.DataFrame({"a": [4, 5, 6], "b": ['four', 'five', 'six']})
+        tds = Dataset.from_pandas(tdf)
+        vds = Dataset.from_pandas(vdf)
+
+
+        ds = DatasetDict()
+
+        ds['train'] = tds
+        ds['validation'] = vds
+
+        print(ds)
+        """
+            
+        if data_args.colpali_source != "all":
+            print(f"Train with samples from {data_args.colpali_source}")
+            print(f"Length of dataset before filtering: {len(self.train_data)}")
+            self.train_data = self.train_data.filter(
+                lambda x: data_args.colpali_source in x['source'],
+                num_proc=4
+            )
+            print(f"Length of dataset after filtering: {len(self.train_data)}")
+            
+            """
+            https://github.com/huggingface/datasets/issues/4684
+            One option is use map with a function that overwrites the labels (dset = dset.map(lamba _: {"label": 0}, features=dset.features)). Or you can use the remove_column + add_column combination (dset = dset.remove_columns("label").add_column("label", [0]*len(data)).cast(dset.features), but note that this approach creates an in-memory table for the added column instead of writing to disk, which could be problematic for large datasets.
+            """
+            
+            temp = self.train_data.remove_columns(["query_image"])
+            def extract_docids(batch):
+                docids = []
+                for pos, src in zip(batch["positive_passages"], batch["source"]):
+                    if data_args.colpali_source in src:
+                        docids.append(int(pos[0]))  # same logic as your lambda
+                return {"_docid_candidate": docids}  # temporary column
+
+            temp_with_docids = temp.map(extract_docids, batched=True, num_proc=4)
+            docid_set = set(docid for docid in temp_with_docids["_docid_candidate"] if docid is not None)
+            
+            del temp_with_docids
+
+            print(f"Length of corpus before filtering: {len(self.corpus)}")
+            self.corpus = self.corpus.select(list(docid_set))
+            print(f"Length of corpus after filtering: {len(self.corpus)}")
+
+            def filter_negatives(batch):
+                batch["negative_passages"] = [
+                    [i for i in negs if int(i) in docid_set] 
+                    for negs in batch["negative_passages"]
+                ]
+                return batch
+
+            # Update the annotated hard negatives that must exist in the filtered corpus
+            self.train_data = self.train_data.map(filter_negatives, batched=True, num_proc=4).cast(self.train_data.features)
+            
+        else:
+            print(f"Train with all data")
+            
 
         self.docid2idx = {}
         if 'docid' in self.corpus.features:
@@ -102,7 +162,7 @@ class TrainDataset(Dataset):
             for idx in range(len(self.corpus)):
                 self.docid2idx[str(idx)] = idx
         if self.data_args.dataset_number_of_shards > 1:
-            self.encode_data = self.encode_data.shard(
+            self.train_data = self.train_data.shard(
                 num_shards=self.data_args.dataset_number_of_shards,
                 index=self.data_args.dataset_shard_index,
             )
@@ -133,7 +193,6 @@ class TrainDataset(Dataset):
         # query = group.get('query', "")
         query = group.get("query_text", "")
         group_positives = group['positive_passages']
-        group_negatives = group['negative_passages']
 
         formated_query = format_query(query, self.data_args.query_prefix)
         formated_passages = []
@@ -146,109 +205,29 @@ class TrainDataset(Dataset):
         formated_passages.append(self._get_image(pos_psg))
         # formated_passages.append(self._get_image(pos_psg['docid']))
 
-        num_negatives = len(group_negatives)
-        negative_size = self.data_args.train_group_size - 1
-        
-        if num_negatives > 0 and num_negatives < negative_size:
-            negs = random.choices(group_negatives, k=negative_size)
-        elif num_negatives == 0 or self.data_args.train_group_size == 1:
-            negs = []
-        elif self.data_args.negative_passage_no_shuffle:
-            negs = group_negatives[:negative_size]
-        else:
-            _offset = epoch * negative_size % len(group_negatives)
-            negs = [x for x in group_negatives]
-            random.Random(_hashed_seed).shuffle(negs)
-            negs = negs * 2
-            negs = negs[_offset: _offset + negative_size]
+        if "negative_passages" in group:
+            group_negatives = group['negative_passages']
+            num_negatives = len(group_negatives)
+            negative_size = self.data_args.train_group_size - 1
+            
+            if num_negatives > 0 and num_negatives < negative_size:
+                negs = random.choices(group_negatives, k=negative_size)
+            elif num_negatives == 0 or self.data_args.train_group_size == 1:
+                negs = []
+            elif self.data_args.negative_passage_no_shuffle:
+                negs = group_negatives[:negative_size]
+            else:
+                _offset = epoch * negative_size % len(group_negatives)
+                negs = [x for x in group_negatives]
+                random.Random(_hashed_seed).shuffle(negs)
+                negs = negs * 2
+                negs = negs[_offset: _offset + negative_size]
 
-        for neg_psg in negs:
-            formated_passages.append(self._get_image(neg_psg))
-            # formated_passages.append(self._get_image(neg_psg['docid']))
+            for neg_psg in negs:
+                formated_passages.append(self._get_image(neg_psg))
+                # formated_passages.append(self._get_image(neg_psg['docid']))
 
         return formated_query, formated_passages
-
-
-class EncodeICLRDataset(Dataset):
-    """
-    Dataset for encoding.
-    Loads data and optionally shards it for distributed processing.
-    """
-
-    def __init__(self, data_args: DataArguments):
-        self.data_args = data_args
-        
-        # This was used for testing ICLR paper retrieval
-        if self.data_args.encode_is_query:
-            self.encode_data = read_json("/home/thuy0050/code/colpali/louis/2017_images_resized/test/query.jsonl", jsonl=True)
-        else:
-            self.encode_data = load_dataset(
-                self.data_args.dataset_name,
-                self.data_args.dataset_config,
-                data_files=self.data_args.dataset_path,
-                split=self.data_args.dataset_split,
-                cache_dir=self.data_args.dataset_cache_dir,
-                num_proc=self.data_args.num_proc,
-            )
-        if self.data_args.dataset_number_of_shards > 1:
-            self.encode_data = self.encode_data.shard(
-                num_shards=self.data_args.dataset_number_of_shards,
-                index=self.data_args.dataset_shard_index,
-            )
-
-    def __len__(self):
-        return len(self.encode_data)
-
-    def __getitem__(self, item):
-        content = self.encode_data[item]
-        
-        if self.data_args.encode_is_query:
-            content_id = content['query_id']
-            content_text = content.get('query_text', "")
-            content_text = self.data_args.query_prefix + content_text
-            content_image = content.get('image', None)
-            # content_video = content.get('query_video', None)
-            # content_audio = content.get('query_audio', None)
-        else:
-            content_id = content['docid']
-            content_text = content.get('text', '')
-            if content_text is None:
-                content_text = ""
-
-            content_text = self.data_args.passage_prefix + content_text.strip()
-            content_image = content.get('image', None)
-            # content_video = content.get('video', None)
-            # content_audio = content.get('audio', None)
-
-
-        # if content_video is not None and self.data_args.encode_video:
-        #     content_video = os.path.join(self.data_args.assets_path, content_video)
-        #     # check if the file exists
-        #     if not os.path.exists(content_video):
-        #         logger.warning(f"Video file {content_video} does not exist.")
-        #         content_video = None
-
-        # if content_audio is not None: # either an dict with 'array' key or a string .mp3 path
-        #     if isinstance(content_audio, dict) and 'array' in content_audio:
-        #         content_audio = content_audio['array']
-        #     else:
-        #         assert isinstance(content_audio, str) and content_audio.endswith('.mp3')
-        #         content_audio = os.path.join(self.data_args.assets_path, content_audio)
-        #         # check if the file exists
-        #         if not os.path.exists(content_audio):
-        #             logger.warning(f"Audio file {content_audio} does not exist.")
-        #             content_audio = None
-
-        if not self.data_args.encode_text:
-            content_text = None
-        if not self.data_args.encode_image:
-            content_image = None
-        # if not self.data_args.encode_video:
-        #     content_video = None
-        # if not self.data_args.encode_audio:
-        #     content_audio = None
-
-        return content_id, content_text, content_image # , content_video, content_audio
 
 
 class EncodeDataset(Dataset):
@@ -301,48 +280,47 @@ class EncodeDataset(Dataset):
         if self.data_args.encode_is_query:
             content_id = content['query_id']
             content_text = content.get('query_text', "")
-            content_text = self.data_args.query_prefix + content_text
+            if content_text is None:
+                content_text = ""
+            content_text = self.data_args.query_prefix + content_text.strip()
             content_image = content.get('image', None)
-            # content_video = content.get('query_video', None)
-            # content_audio = content.get('query_audio', None)
         else:
             content_id = content['docid']
-            content_text = content.get('text', '')
+            content_text = content.get('text', "")
             if content_text is None:
                 content_text = ""
             if 'title' in content:
                 content_text = content['title'] + ' ' + content_text
             content_text = self.data_args.passage_prefix + content_text.strip()
             content_image = content.get('image', None)
-            # content_video = content.get('video', None)
-            # content_audio = content.get('audio', None)
 
+        return content_id, content_text, content_image
+    
 
-        # if content_video is not None and self.data_args.encode_video:
-        #     content_video = os.path.join(self.data_args.assets_path, content_video)
-        #     # check if the file exists
-        #     if not os.path.exists(content_video):
-        #         logger.warning(f"Video file {content_video} does not exist.")
-        #         content_video = None
+class EncodeICLRDataset(EncodeDataset):
+    """
+    Dataset for encoding.
+    Loads data and optionally shards it for distributed processing.
+    """
 
-        # if content_audio is not None: # either an dict with 'array' key or a string .mp3 path
-        #     if isinstance(content_audio, dict) and 'array' in content_audio:
-        #         content_audio = content_audio['array']
-        #     else:
-        #         assert isinstance(content_audio, str) and content_audio.endswith('.mp3')
-        #         content_audio = os.path.join(self.data_args.assets_path, content_audio)
-        #         # check if the file exists
-        #         if not os.path.exists(content_audio):
-        #             logger.warning(f"Audio file {content_audio} does not exist.")
-        #             content_audio = None
+    def __init__(self, data_args: DataArguments):
+        self.data_args = data_args
+        
+        # This was used for testing ICLR paper retrieval
+        if self.data_args.encode_is_query:
+            self.encode_data = read_json("/home/thuy0050/code/colpali/louis/2017_images_resized/test/query.jsonl", jsonl=True)
+        else:
+            self.encode_data = load_dataset(
+                self.data_args.dataset_name,
+                self.data_args.dataset_config,
+                data_files=self.data_args.dataset_path,
+                split=self.data_args.dataset_split,
+                cache_dir=self.data_args.dataset_cache_dir,
+                num_proc=self.data_args.num_proc,
+            )
+        if self.data_args.dataset_number_of_shards > 1:
+            self.encode_data = self.encode_data.shard(
+                num_shards=self.data_args.dataset_number_of_shards,
+                index=self.data_args.dataset_shard_index,
+            )
 
-        if not self.data_args.encode_text:
-            content_text = None
-        if not self.data_args.encode_image:
-            content_image = None
-        # if not self.data_args.encode_video:
-        #     content_video = None
-        # if not self.data_args.encode_audio:
-        #     content_audio = None
-
-        return content_id, content_text, content_image # , content_video, content_audio

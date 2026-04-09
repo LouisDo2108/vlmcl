@@ -4,19 +4,267 @@ from copy import deepcopy
 from dataclasses import asdict
 from pdb import set_trace as st
 from pprint import pprint
-from typing import ClassVar, List, Optional, Tuple, Union
+from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from colpali_engine.utils.processing_utils import BaseVisualRetrieverProcessor
 from peft import LoraConfig
 from PIL import Image
-
+from tevatron.colpali.losses import ColbertLoss
 from tevatron.colpali.utils import get_params_info, init, set_seed, write_json
-from torch import nn
+from tevatron.retriever.modeling.encoder import EncoderModel, EncoderOutput
+from torch import Tensor, nn
 from transformers import BatchEncoding, BatchFeature
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.models.qwen3_vl import Qwen3VLConfig, Qwen3VLModel, Qwen3VLProcessor
 from transformers.utils.import_utils import is_flash_attn_2_available
+
+
+class DenseModel(EncoderModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # self.use_smooth_max = False
+        self.normalize_scores = True
+        self.tau = 0.1 # Default from ColbertModule
+        self.norm_tol = 1e-3
+        self.pairwise_ce_loss = kwargs.get("pairwise_ce_loss", None)
+        self.filter_false_negatives = kwargs.get("filter_false_negatives", None)
+        self.pairwise_inbatch_neg_loss = kwargs.get("pairwise_inbatch_neg_loss", None)
+        self.pairwise_inbatch_neg_loss_weight = kwargs.get("pairwise_inbatch_neg_loss_weight", None)
+        # self.loss_func = ColbertLoss(
+        #     temperature=0.02,
+        #     normalize_scores=True,
+        #     use_smooth_max=False,
+        #     pos_aware_negative_filtering=False,
+        # )
+
+    def encode_query(self, qry, embedding_projection=True):
+        query_hidden_states = self.encoder(**qry, embedding_projection=embedding_projection, return_dict=True)
+        return query_hidden_states
+        # query_hidden_states = query_hidden_states.last_hidden_state
+        # return self._pooling(query_hidden_states, qry['attention_mask'])
+    
+    def encode_passage(self, psg, embedding_projection=True):
+        # encode passage is the same as encode query
+        return self.encode_query(psg, embedding_projection=embedding_projection)
+        
+    def _pooling(self, last_hidden_state, attention_mask):
+        if self.pooling in ['cls', 'first']:
+            reps = last_hidden_state[:, 0]
+        elif self.pooling in ['mean', 'avg', 'average']:
+            masked_hiddens = last_hidden_state.masked_fill(~attention_mask[..., None].bool(), 0.0)
+            reps = masked_hiddens.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+        elif self.pooling in ['last', 'eos']:
+            left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
+            if left_padding:
+                reps = last_hidden_state[:, -1]
+            else:
+                sequence_lengths = attention_mask.sum(dim=1) - 1
+                batch_size = last_hidden_state.shape[0]
+                reps = last_hidden_state[torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
+        else:
+            raise ValueError(f'unknown pooling method: {self.pooling}')
+        if self.normalize:
+            reps = torch.nn.functional.normalize(reps, p=2, dim=-1)
+        return reps
+    
+    def _smooth_max(self, scores: torch.Tensor, dim: int) -> torch.Tensor:
+        """
+        Compute smooth max via log-sum-exp along a given dimension.
+        """
+        return self.tau * torch.logsumexp(scores / self.tau, dim=dim)
+    
+    def _aggregate(
+        self,
+        scores_raw: torch.Tensor,
+        use_smooth_max: bool,
+        dim_max: int,
+        dim_sum: int,
+    ) -> torch.Tensor:
+        """
+        Aggregate token-level scores into document-level.
+
+        Args:
+            scores_raw (Tensor): Raw scores tensor.
+            use_smooth_max (bool): Use smooth-max if True.
+            dim_max (int): Dimension to perform max/logsumexp.
+            dim_sum (int): Dimension to sum over after max.
+        """
+        # if use_smooth_max:
+        #     return self._smooth_max(scores_raw, dim=dim_max).sum(dim=dim_sum)
+        return scores_raw.amax(dim=dim_max).sum(dim=dim_sum)
+    
+    def _apply_normalization(self, scores: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize scores by query lengths and enforce bounds.
+
+        Args:
+            scores (Tensor): Unnormalized score matrix [B, C].
+            lengths (Tensor): Query lengths [B].
+
+        Returns:
+            Tensor: Normalized scores.
+
+        Raises:
+            ValueError: If normalized scores exceed tolerance.
+        """
+        if scores.ndim == 2:
+            normalized = scores / lengths.unsqueeze(1)
+        else:
+            normalized = scores / lengths
+
+        # mn, mx = torch.aminmax(normalized)
+        # if mn < -self.norm_tol or mx > 1 + self.norm_tol:
+        #     print(
+        #         f"Scores out of bounds after normalization: "
+        #         f"min={mn.item():.4f}, max={mx.item():.4f}, tol={self.norm_tol}"
+        #     )
+        return normalized
+    
+    def compute_similarity(self, q_reps, p_reps):
+        lengths = (q_reps[:, :, 0] != 0).sum(dim=1)
+        raw = torch.einsum("bnd,csd->bcns", q_reps, p_reps)
+        scores = self._aggregate(raw, use_smooth_max=False, dim_max=3, dim_sum=2)
+        if self.normalize_scores:
+            scores = self._apply_normalization(scores, lengths)
+        return scores
+    
+    def get_index_and_masks(self, num_neg, scores):
+        B = scores.size(0)
+        device = scores.device
+        
+        # The positive passages
+        target = torch.arange(
+            B,
+            device=device,
+            dtype=torch.long,
+        ) * num_neg
+
+        # # A mask to filter out the positive and annotated negatives
+        # no_filter_mask = torch.stack(
+        #     [
+        #         torch.arange(
+        #             x,
+        #             x + num_neg,
+        #             device=scores_semantic.device,
+        #             dtype=torch.long,
+        #         )
+        #         for x in target
+        #     ]
+        # )
+        no_filter_mask = target.unsqueeze(1) + torch.arange(num_neg, device=device, dtype=torch.long)
+        
+        row_idx = torch.arange(
+            B, device=device
+        )
+
+        return target, row_idx, no_filter_mask
+
+    def mask_inbatch_negative_percentile(self, scores, target, row_idx, no_filter_mask=None, percentile=0.95):
+        # semantic_thresholds = scores_semantic[row_idx, target] * percentile  # shape: [B]
+        pos_scores = scores.gather(1, target.unsqueeze(1))
+        threshold = pos_scores * percentile
+
+        # mask = scores_semantic > semantic_thresholds.unsqueeze(1)  # Mask out those greater than the threshold
+        mask = scores > threshold
+        
+        if no_filter_mask is not None:
+            B = scores.size(0)
+            device = scores.device
+            
+            rows = torch.arange(B, device=device).unsqueeze(1).expand_as(no_filter_mask)
+            mask[rows, no_filter_mask] = False  # type: ignore # don't mask the positive and annotated negatives, only consider the other in-batch negatives
+
+        # Apply the mask
+        scores.masked_fill_(mask, float('-inf'))
+        return scores
+    
+    def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None, embedding_projection=True): # type: ignore
+        q_reps = self.encode_query(query, embedding_projection) if query else None
+        p_reps = self.encode_passage(passage, embedding_projection) if passage else None
+
+        # for inference
+        if q_reps is None or p_reps is None:
+            return EncoderOutput(
+                q_reps=q_reps,
+                p_reps=p_reps
+            )
+
+        # for training
+        if self.training:
+            if self.is_ddp:
+                q_reps = self._dist_gather_tensor(q_reps)
+                p_reps = self._dist_gather_tensor(p_reps)
+                
+            # scores, loss = self.loss_func(
+            #     query_embeddings=q_reps,
+            #     doc_embeddings=p_reps,
+            #     offset=0,
+            # )
+            target = None
+            row_idx = None
+            no_filter_mask = None
+            num_neg = p_reps.size(0) // q_reps.size(0)
+
+            scores = self.compute_similarity(q_reps, p_reps)
+            scores = scores.view(q_reps.size(0), -1)
+
+            # target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
+            # target = target * (p_reps.size(0) // q_reps.size(0))
+            
+            # Create useful masks for calculating different losses
+            # Which will be reused later on
+            if target is None:
+                target, row_idx, no_filter_mask = self.get_index_and_masks(num_neg, scores)
+
+            # (Optional) Filter potential false negatives by filtering samples with simialrty greater than 95% compared to the ground truth
+            if self.filter_false_negatives:
+                scores = self.mask_inbatch_negative_percentile(scores, target, row_idx, no_filter_mask, percentile=0.95)
+            
+            if self.pairwise_ce_loss:
+                top2 = scores.topk(2, dim=1).values
+                pos_scores = scores[row_idx, target]
+                neg_scores = torch.where(top2[:, 0] == pos_scores, top2[:, 1], top2[:, 0])
+                
+                loss_pairwise_ce = F.softplus((neg_scores - pos_scores) / self.temperature).mean()
+                
+                if self.pairwise_inbatch_neg_loss:
+                    loss_infonce_w_inbatch_neg = self.compute_loss(scores / self.temperature, target)
+                    loss = (1 - self.pairwise_inbatch_neg_loss_weight) * loss_pairwise_ce + self.pairwise_inbatch_neg_loss_weight * loss_infonce_w_inbatch_neg
+                    losses = {
+                        "loss": loss,
+                        "total_loss": loss.clone().detach(),
+                        "loss_infonce_w_inbatch_neg": self.pairwise_inbatch_neg_loss_weight * loss_infonce_w_inbatch_neg.clone().detach(),
+                        "loss_pairwise_ce": (1 - self.pairwise_inbatch_neg_loss_weight) * loss_pairwise_ce.clone().detach(),
+                    }
+                else:
+                    loss = loss_pairwise_ce
+                    losses = {
+                        "loss": loss,
+                        "loss_pairwise_ce": loss.clone().detach(),
+                    }
+            else:
+                # Normal in-batch negatives with optional annotated hard negatives InfoNCE loss
+                loss = self.compute_loss(scores / self.temperature, target)
+                losses = {
+                    "loss": loss,
+                    "infonce_loss": loss.clone().detach(),
+                }
+            
+            # if self.is_ddp:
+            #     loss = loss * self.world_size  # counter average weight reduction
+            return losses
+        # for eval
+        else:
+            scores = self.compute_similarity(q_reps, p_reps) # self.loss_func.compute_similarity(q_reps, p_reps, offset=0)
+            loss = None
+            return EncoderOutput(
+                loss=loss,
+                scores=scores,
+                q_reps=q_reps,
+                p_reps=p_reps,
+            )
 
 
 class ColQwen3Processor(BaseVisualRetrieverProcessor, Qwen3VLProcessor):
@@ -64,7 +312,6 @@ class ColQwen3Processor(BaseVisualRetrieverProcessor, Qwen3VLProcessor):
             device_map=device_map,
             **kwargs,
         )
-
         if "max_num_visual_tokens" in kwargs and kwargs["max_num_visual_tokens"]:
             patch_size = getattr(instance.image_processor, "patch_size", None)
             merge_size = getattr(instance.image_processor, "merge_size", None)
@@ -233,12 +480,14 @@ class ColQwen3(Qwen3VLModel):
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         # Handle the custom "pixel_values" input obtained with `ColQwen3Processor` through unpadding
+        # print("pixel_values before", kwargs["pixel_values"].shape)
         if "pixel_values" in kwargs:
             offsets = kwargs["image_grid_thw"][:, 1] * kwargs["image_grid_thw"][:, 2]  # (batch_size,)
             kwargs["pixel_values"] = torch.cat(
                 [pixel_sequence[:offset] for pixel_sequence, offset in zip(kwargs["pixel_values"], offsets)],
                 dim=0,
             )
+        # print("pixel_values after", kwargs["pixel_values"].shape)
         
 
         kwargs.pop("return_dict", True)
@@ -250,12 +499,21 @@ class ColQwen3(Qwen3VLModel):
             .forward(*args, **kwargs, use_cache=False, output_hidden_states=True, return_dict=True)
             .last_hidden_state
         )  # (batch_size, sequence_length, hidden_size)
+        
+        # print("last_hidden_states before projection", last_hidden_states.shape)
+        
+        if isinstance(self.custom_text_proj, nn.Module) and kwargs["embedding_projection"]:
 
-        proj = self.custom_text_proj(last_hidden_states)  # (batch_size, sequence_length, dim)
+            proj = self.custom_text_proj(last_hidden_states)  # (batch_size, sequence_length, dim)
 
-        # L2 normalization
-        proj = proj / proj.norm(dim=-1, keepdim=True)  # (batch_size, sequence_length, dim)
-        proj = proj * kwargs["attention_mask"].unsqueeze(-1)  # (batch_size, sequence_length, dim)
+            # L2 normalization
+            proj = proj / proj.norm(dim=-1, keepdim=True)  # (batch_size, sequence_length, dim)
+            proj = proj * kwargs["attention_mask"].unsqueeze(-1)  # (batch_size, sequence_length, dim)
+            # print("last_hidden_states after projection", proj.shape)
+        else:
+            last_hidden_states = last_hidden_states / last_hidden_states.norm(dim=-1, keepdim=True)
+            last_hidden_states = last_hidden_states * kwargs["attention_mask"].unsqueeze(-1)
+            return last_hidden_states
 
         if "pixel_values" in kwargs and self.mask_non_image_embeddings:
             # Pools only the image embeddings

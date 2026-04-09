@@ -46,11 +46,34 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
 
 cd /home/thuy0050/code/vlmcl
 
-OUTPUT_DIR="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/1epoch_colpali_inbatchneg"
+OUTPUT_DIR="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/1epoch_arxiv_qa_inbatchneg"
+mkdir -p $OUTPUT_DIR
 
-# python 
+# accelerate launch src/tevatron/colpali/train.py \
+#   --model_name_or_path "/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/models/colqwen3-base" \
+#   --dataset_name "tevatron/colpali" \
+#   --dataset_split "train" \
+#   --corpus_name "tevatron/colpali-corpus" \
+#   --corpus_split "train" \
+#   --gradient_checkpointing \
+#   --learning_rate 1e-4 \
+#   --per_device_train_batch_size 32 \
+#   --train_group_size 4 \
+#   --logging_steps 10 \
+#   --dataloader_num_workers 8 \
+#   --num_train_epochs 1 \
+#   --colpali_source "arxiv_qa" \
+#   --output_dir $OUTPUT_DIR \
+#   > $OUTPUT_DIR/out.txt
+
+
+OUTPUT_DIR="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/1epoch_docvqa_inbatchneg_after_arxiv_qa"
+LORA_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/1epoch_arxiv_qa_inbatchneg/checkpoint-311"
+mkdir -p $OUTPUT_DIR
+
 accelerate launch src/tevatron/colpali/train.py \
   --model_name_or_path "/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/models/colqwen3-base" \
+  --lora_name_or_path $LORA_NAME_OR_PATH \
   --dataset_name "tevatron/colpali" \
   --dataset_split "train" \
   --corpus_name "tevatron/colpali-corpus" \
@@ -58,13 +81,11 @@ accelerate launch src/tevatron/colpali/train.py \
   --gradient_checkpointing \
   --learning_rate 1e-4 \
   --per_device_train_batch_size 32 \
-  --train_group_size 1 \
+  --train_group_size 4 \
   --logging_steps 10 \
   --dataloader_num_workers 8 \
   --num_train_epochs 1 \
+  --colpali_source "docvqa" \
+  --continual_learning \
   --output_dir $OUTPUT_DIR \
   > $OUTPUT_DIR/out.txt
-# --num_train_epochs 1 \
-# --eval_strategy="steps" \
-# --eval_steps=1 \
-# --dataloader_num_workers 8 \

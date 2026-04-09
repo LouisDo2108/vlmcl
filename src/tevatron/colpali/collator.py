@@ -1,15 +1,11 @@
 import logging
-from typing import List, Tuple
 from dataclasses import dataclass
-from transformers import ProcessorMixin
-from qwen_vl_utils import process_vision_info
-from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
-from PIL import Image
-from pdb import set_trace as st
+from typing import List, Tuple
+
 import torch
-
-from arguments import DataArguments
-
+from qwen_vl_utils import process_vision_info
+from tevatron.colpali.arguments import DataArguments
+from transformers import ProcessorMixin
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +77,6 @@ class TrainCollator:
             padding="longest",
             return_tensors="pt",
         )
-        # print("Query")
-        # for k, v in query_inputs.items():
-        #     print(k, v.shape)
 
         passage_inputs = self.processor(
             text=passage_texts,
@@ -92,9 +85,6 @@ class TrainCollator:
             padding="longest",
             return_tensors="pt",
         )
-        # print("before pixel_value fix passage")
-        # for k, v in passage_inputs.items():
-        #     print(k, v.shape)
             
         # NOTE: The following adjustment ensures correct behavior with DDP on multiple GPUs.
         offsets = passage_inputs["image_grid_thw"][:, 1] * passage_inputs["image_grid_thw"][:, 2]  # (batch_size,)
@@ -108,9 +98,6 @@ class TrainCollator:
         passage_inputs["pixel_values"] = torch.nn.utils.rnn.pad_sequence(
             pixel_values, batch_first=True
         )  # (batch_size, max_num_patches, pixel_values)
-        # print("after pixel_value fix passage")
-        # for k, v in passage_inputs.items():
-        #     print(k, v.shape)
 
         return query_inputs, passage_inputs
     
@@ -125,56 +112,77 @@ class EncodeCollator:
         Collate function for encoding.
         :param features: list of (id, text) tuples
         """
-        text_ids = [x[0] for x in features]
-        passages = [x[1] for x in features]
-        max_length = self.data_args.query_max_len if self.data_args.encode_is_query else self.data_args.passage_max_len
-        
-        if self.data_args.encode_is_query:
-            query_texts = []
-            for text in passages:
-                query_texts.append(text)
-            inputs = self.processor(
-                text=query_texts,
-                padding="max_length",
-                max_length=max_length,
-            )
-        else:
-            images = []
-            for idx in range(len(passages)):
-                image = passages[idx]
-                images.append(image)
-            # inputs = self.processor(
-            #     images=images,
-            # )
-            # if isinstance(self.processor, ColQwen2_5_Processor):
-            inputs = self.processor.process_images(images)
-            # else:
-            #     raise ValueError("Not ColQwen2_5_Processor")
-        
-        return text_ids, inputs
-
-
-@dataclass
-class MultiModalEncodeCollator:
-    """
-    collator for text-visual data.
-    """
-    data_args: DataArguments
-    processor: ProcessorMixin
-
-    def __call__(self, features):
-        """
-        Collate function for encoding.
-        :param features: list of (id, text, image) tuples
-        but in this case, it's just image is None
-        """
         content_ids = [x[0] for x in features]
         texts = [x[1] for x in features]
         images = [x[2] for x in features]
 
-        collated_inputs = {
-            "texts": self.processor.process_texts(texts) if None not in texts else None,
-            "images": self.processor.process_images(images) if None not in images else None
-        }
+        max_length = self.data_args.query_max_len if self.data_args.encode_is_query else self.data_args.passage_max_len
+
         
-        return content_ids, collated_inputs
+        if self.data_args.encode_is_query:
+            query_messages = []
+            for query in texts:
+                message = [
+                    {
+                        'role': 'user',
+                        'content': [
+                            # {'type': 'image', 'image': Image.new('RGB', (28, 28)), 'resized_height': 1, 'resized_width': 1},
+                            # {'type': 'image', 'image': image},
+                            {'type': 'text', 'text': f'Query: {query}'}
+                        ]
+                    }
+                ]
+                query_messages.append(message)
+            
+            query_texts = [
+                self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False) + '<|endoftext|>' * N_AUGMENTATION_TOKENS
+                for msg in query_messages
+            ]
+            
+            query_image_inputs, _ = process_vision_info(query_messages, image_patch_size=16)
+
+            query_inputs = self.processor(
+                text=query_texts,
+                images=query_image_inputs,
+                padding="max_length", # Ensure padding to max length
+                max_length=max_length, # Ensure padding to max length
+                return_tensors="pt",
+            )
+            print(query_inputs['input_ids'].shape)
+            return content_ids, query_inputs
+        else:
+            passage_messages = []
+            for image in images:
+                # print(image.size)
+                message = [
+                    {
+                        'role': 'user',
+                        ## TODO: should use the original shape, instead of reshape for fixed size embeddings, which has massive amount of padding tokens.
+                        'content': [
+                            {'type': 'image', 'image': image, 'resized_height': 784, 'resized_width': 784},
+                            {'type': 'text', 'text': f'Describe the image.'}
+                        ]
+                    }
+                ]
+                passage_messages.append(message)
+            passage_texts = [
+                self.processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=False) + '<|endoftext|>'
+                for msg in passage_messages
+            ]
+            
+            passage_image_inputs, _ = process_vision_info(passage_messages, image_patch_size=16)
+
+            passage_inputs = self.processor(
+                text=passage_texts,
+                images=passage_image_inputs,
+                padding="longest",
+                return_tensors="pt",
+            )            
+            offsets = passage_inputs["image_grid_thw"][:, 1] * passage_inputs["image_grid_thw"][:, 2]  # (batch_size,)
+            pixel_values = list(
+                torch.split(passage_inputs["pixel_values"], offsets.tolist())
+            )
+            passage_inputs["pixel_values"] = torch.nn.utils.rnn.pad_sequence(
+                pixel_values, batch_first=True
+            )
+            return content_ids, passage_inputs

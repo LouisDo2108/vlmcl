@@ -4,23 +4,24 @@ import pickle
 import sys
 from contextlib import nullcontext
 from pdb import set_trace as st
+from pathlib import Path
 
 import numpy as np
 import torch
-from collator import EncodeCollator, MultiModalEncodeCollator
-from colpali_engine.models import (
-    ColQwen2_5,
-    ColQwen2_5_Processor,
-    ColQwen3,
-    ColQwen3Processor,
-)
-from dataset import EncodeDataset, EncodeICLRDataset
-from tevatron.retriever.arguments import DataArguments, ModelArguments
-from tevatron.retriever.arguments import TevatronTrainingArguments as TrainingArguments
+from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
+from tevatron.colpali.models import ColQwen3, ColQwen3Processor, DenseModel
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model, get_model_status
+from tevatron.colpali.arguments import DataArguments, ModelArguments
+from tevatron.colpali.arguments import TevatronTrainingArguments as TrainingArguments
+from tevatron.colpali.collator import EncodeCollator
+from tevatron.colpali.dataset import EncodeDataset, EncodeICLRDataset
+from tevatron.colpali.models import DenseModel
+from tevatron.retriever.modeling.encoder import EncoderOutput
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import HfArgumentParser
 from transformers.utils.import_utils import is_flash_attn_2_available
+# from tevatron.colpali.index import save_colbert_index
 
 logger = logging.getLogger(__name__)
 
@@ -59,23 +60,80 @@ def main():
     processor = processor_cls.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         trust_remote_code=True,
-        query_max_len=data_args.query_max_len,
-        trust_remote_code=True, #type:ignore
-        # cache_dir=model_args.cache_dir,
+        fix_mistral_regex=True,
+        max_num_visual_tokens=getattr(training_args, "max_num_visual_tokens", None),
     )
 
-    model = model_cls.from_pretrained(
+    base_model = model_cls.from_pretrained(
         model_args.model_name_or_path,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa",
         trust_remote_code=True,
+    )
+    
+    def load_lora_model(lora_name_or_path, base_model):
+        print(f"Loading LoRA from {lora_name_or_path}")
+        lora_config = LoraConfig.from_pretrained(
+            lora_name_or_path,
+            torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa",
+            trust_remote_code=True
+        )
+        lora_model = PeftModel.from_pretrained(
+            base_model, lora_name_or_path, 
+            config=lora_config, 
+            adapter_name=lora_name_or_path
+        )
+        return lora_model
+
+    lora_paths = None
+    if Path(model_args.lora_name_or_path).suffix == ".txt":
+        # Read the list of lora paths
+        with open(model_args.lora_name_or_path) as f:
+            lora_paths = f.readlines()
+        
+        lora_paths = [x.strip() for x in lora_paths]
+        
+        # The most naive way to load
+        # lora_model1 = load_lora_model(lora_paths[0].strip(), base_model)
+        # lora_model1 = lora_model1.merge_and_unload(progressbar=True)
+        # lora_model1 = load_lora_model(lora_paths[1].strip(), lora_model1)
+        # lora_model1 = lora_model1.merge_and_unload(progressbar=True)
+        
+        # Load the base model along with the first LoRA
+        lora_model = load_lora_model(lora_paths[0], base_model)
+    
+        # Load the remaining LoRAs in the list
+        for lora_path in lora_paths[1:]:
+            print(f"Loading LoRA from {lora_path}")
+            lora_model.load_adapter(
+                lora_path, 
+                adapter_name=lora_path
+            )
+            # lora_model.set_adapter(lora_path.strip())
+            # print(lora_model.active_adapter)
+            # print(get_model_status(lora_model).available_adapters)
+        
+        lora_model = lora_model.merge_and_unload(
+            progressbar=True, 
+            adapter_names=lora_paths if lora_paths is not None else [model_args.lora_name_or_path.strip()]
+        ) # type: ignore
+        
+        # Another way but with worse performance
+        # lora_model.add_weighted_adapter([x.strip() for x in lora_paths], [1.0]*len(lora_paths), "merge", combination_type="linear")
+        # lora_model = lora_model.merge_and_unload(adapter_names=["merge"])
+    else:
+        lora_model = load_lora_model(model_args.lora_name_or_path, base_model)
+    
+    model = DenseModel(
+        encoder=lora_model,
     )
 
     encode_dataset = EncodeDataset(
         data_args=data_args,
     )
 
-    encode_collator = MultiModalEncodeCollator(
+    encode_collator = EncodeCollator(
         data_args=data_args,
         processor=processor,
     )
@@ -86,7 +144,7 @@ def main():
         collate_fn=encode_collator,
         shuffle=False,
         drop_last=False,
-        num_workers=0, # training_args.dataloader_num_workers,
+        num_workers=training_args.dataloader_num_workers,
     )
     encoded = []
     lookup_indices = []
@@ -106,23 +164,37 @@ def main():
                 for k, v in batch.items():
                     if v is not None:
                         batch[k] = v.to(training_args.device)
-
+                    
                 if data_args.encode_is_query:
-                    texts, _ = batch['texts'], batch['images']
-                    model_output = model(**texts)
+                    
+                    model_output: EncoderOutput = model(
+                        query=batch, 
+                        embedding_projection=training_args.embedding_projection
+                    )
+                    encoded.append(model_output.q_reps.cpu().half())
                 else:
-                    _, images = batch['texts'], batch['images']
-                    model_output = model(**images)
+                    model_output: EncoderOutput = model(
+                        passage=batch, 
+                        embedding_projection=training_args.embedding_projection
+                    )
+                    encoded.append(model_output.p_reps.cpu().half())
                 
-                encoded.append(model_output.cpu().detach().half()) 
                 print(encoded[-1].shape)
             # if ix > 1:
             #     break
 
+    # save_colbert_index(
+    #     embeddings_list=encoded,
+    #     doc_ids=lookup_indices,
+    #     output_dir="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/1epoch_colpali_inbatchneg/checkpoint-3694/out_no_embedding_projection/vidore/arxivqa_test_subsampled_beir/colbert_index" # data_args.encode_output_path,
+    # )
+    # Old logic that save a fixed size tensor index
     encoded = torch.cat(encoded, dim=0)
+    
     with open(data_args.encode_output_path, 'wb') as f:
         pickle.dump((encoded, lookup_indices), f)
 
+    print(f"Writting embeddings to {data_args.encode_output_path}")
 
 if __name__ == "__main__":
     main()

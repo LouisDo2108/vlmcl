@@ -5,8 +5,9 @@ import glob
 from argparse import ArgumentParser
 from itertools import chain
 from tqdm import tqdm
-from transformers import ColPaliProcessor
-from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
+# from transformers import ColPaliProcessor
+# from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
+from tevatron.colpali.models import ColQwen3Processor
 import torch
 
 import logging
@@ -57,12 +58,6 @@ def main():
     q_reps, q_lookup = pickle_load(args.query_reps)
     q_reps = q_reps.to('cuda')
 
-    # retriever = ColPaliProcessor.from_pretrained(args.processor_name)
-    retriever = ColQwen2_5_Processor.from_pretrained(
-        args.processor_name
-    )
-
-
     index_files = glob.glob(args.passage_reps)
     logger.info(f'Pattern match found {len(index_files)} shards.')
     p_reps_0, p_lookup_0 = pickle_load(index_files[0])
@@ -72,6 +67,12 @@ def main():
         shards = tqdm(shards, desc='Scoring shards', total=len(index_files))
     psg_indices = []
     all_scores = []
+    
+    # retriever = ColPaliProcessor.from_pretrained(args.processor_name)
+    retriever = ColQwen3Processor.from_pretrained(
+        args.processor_name
+    )
+    
     for reps, look_up in shards:
         reps = reps.to('cuda')
         # scores = retriever.score_retrieval(q_reps, reps) # (num_queries, num_passages)

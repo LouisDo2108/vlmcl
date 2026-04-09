@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
-
+from pdb import set_trace as st
 
 class ColbertModule(torch.nn.Module):
     """
@@ -158,6 +158,7 @@ class ColbertLoss(ColbertModule):
             Tensor: Scalar loss value.
         """
         lengths = (query_embeddings[:, :, 0] != 0).sum(dim=1)
+
         raw = torch.einsum("bnd,csd->bcns", query_embeddings, doc_embeddings)
         scores = self._aggregate(raw, self.use_smooth_max, dim_max=3, dim_sum=2)
         if self.normalize_scores:

@@ -8,6 +8,7 @@ from datasets import (
     Features,
     load_dataset,
 )
+from pdb import set_trace as st
 
 encoder = msgspec.json.Encoder()
 decoder = msgspec.json.Decoder()
@@ -25,8 +26,8 @@ mapping_dict = {
     "corpus2": "corpus_2.json"
 }
 
-in_domain = pd.read_csv(metadata_folder / mapping_dict["in_domain"])[["product_id", "image_local"]]
-novel_query = pd.read_csv(metadata_folder / mapping_dict["novel_query"])[["product_id", "image_local"]]
+in_domain = pd.read_csv(metadata_folder / mapping_dict["in_domain"])[["product_id", "image_local", "title"]]
+novel_query = pd.read_csv(metadata_folder / mapping_dict["novel_query"])[["product_id", "image_local", "title"]]
 corpus = pd.concat([in_domain, novel_query], axis=0).drop_duplicates().reset_index(drop=True)
 corpus.rename(columns={
     "image_local": "file_name",
@@ -34,6 +35,7 @@ corpus.rename(columns={
 }, inplace=True)
 corpus["file_name"] = corpus["file_name"].apply(lambda x: Path(x).name)
 corpus['docid'] = corpus['docid'].astype(str)
+corpus['title'] = corpus['title'].astype(str)
 
 corpus.to_csv("/home/thuy0050/mg61_scratch2/thuy0050/data/marqo-gs-dataset/images_wfash/metadata.csv", index=False)
 
@@ -43,6 +45,6 @@ dataset = load_dataset(
     "imagefolder", 
     data_dir=base_path, 
     split="train",
-    features=Features({'docid': Value('string'), 'image': Image(), 'file_name': Value('string')}),
+    features=Features({'docid': Value('string'), 'image': Image(), 'title': Value('string'), 'file_name': Value('string')}),
 )
 dataset.push_to_hub("LouisDo2108/marqo_gs_wfash_1m_corpus_tevatron")

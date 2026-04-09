@@ -44,36 +44,55 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
 
 # Useful for pytorch debugging: torch.autograd.set_detect_anomaly(True)
 
-cd /home/thuy0050/code/colpali/tevatron
+cd /home/thuy0050/code/vlmcl
 
-# MODEL_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/colqwen_cl/colqwen3/1epoch_colpali_train_set"
-MODEL_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/colqwen_cl/colqwen3_tevatron_test_saving"
-DATASET_NAME="vidore/arxivqa_test_subsampled_beir"
+BASE_MODEL_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/models/colqwen3-base"
+MODEL_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/1epoch_docvqa_inbatchneg_after_arxiv_qa"
+LORAS_NAME_OR_PATH=$MODEL_NAME_OR_PATH/lora_paths.txt # $MODEL_NAME_OR_PATH/checkpoint-311
+DATASET_NAME="vidore/docvqa_test_subsampled_beir"
+QREL_PATH="/home/thuy0050/mg61_scratch2/thuy0050/data/vlmcl/vidore_v1_qrels/docvqa_test_subsampled_beir_qrel.txt"
+
+echo $MODEL_NAME_OR_PATH
+
+# "vidore/arxivqa_test_subsampled_beir"
+# "vidore/docvqa_test_subsampled_beir"
+# "vidore/infovqa_test_subsampled_beir"
+# "vidore/tatdqa_test_beir"
+
+
 OUTPUT_DIR=$MODEL_NAME_OR_PATH/out/$DATASET_NAME
+mkdir -p $OUTPUT_DIR
 
 
-python /home/thuy0050/code/colpali/tevatron/examples/colpali/encode.py \
+python src/tevatron/colpali/encode.py \
   --output_dir=$OUTPUT_DIR \
-  --model_name_or_path $MODEL_NAME_OR_PATH \
+  --model_name_or_path $BASE_MODEL_NAME_OR_PATH \
+  --lora_name_or_path $LORAS_NAME_OR_PATH \
   --bf16 \
   --dataset_name $DATASET_NAME \
   --dataset_split test \
   --dataset_config corpus \
-  --per_device_eval_batch_size 128 \
+  --per_device_eval_batch_size 64 \
+  --dataloader_num_workers 4 \
+  --embedding_projection True \
   --encode_output_path $OUTPUT_DIR/corpus.pkl
 
-  python /home/thuy0050/code/colpali/tevatron/examples/colpali/encode.py \
+python src/tevatron/colpali/encode.py \
   --output_dir=$OUTPUT_DIR \
-  --model_name_or_path $MODEL_NAME_OR_PATH \
+  --model_name_or_path $BASE_MODEL_NAME_OR_PATH \
+  --lora_name_or_path $LORAS_NAME_OR_PATH \
   --bf16 \
   --dataset_name $DATASET_NAME \
   --dataset_split test \
   --dataset_config queries \
-  --per_device_eval_batch_size 128 \
+  --query_max_len 256 \
+  --per_device_eval_batch_size 64 \
+  --dataloader_num_workers 4 \
+  --embedding_projection True \
   --encode_output_path $OUTPUT_DIR/query.pkl \
   --encode_is_query
 
-python /home/thuy0050/code/colpali/tevatron/examples/colpali/search.py \
+python src/tevatron/colpali/search.py \
     --query_reps $OUTPUT_DIR/query.pkl \
     --passage_reps $OUTPUT_DIR/corpus.pkl \
     --depth 100 \
@@ -88,5 +107,5 @@ python -m tevatron.utils.format.convert_result_to_trec \
 
 python -m pyserini.eval.trec_eval -c \
   -m recall.10,100 -m ndcg_cut.10 -M 100 \
-  /home/thuy0050/code/vlmcl/src/tevatron/colpali/arxiv_test_subsampled_beir_qrel.txt \
-  $OUTPUT_DIR/rank.trec > $OUTPUT_DIR/out.txt
+  $QREL_PATH \
+  $OUTPUT_DIR/rank.trec > $OUTPUT_DIR/out.txt 

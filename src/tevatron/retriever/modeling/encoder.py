@@ -31,6 +31,8 @@ class EncoderModel(nn.Module):
                  pooling: str = 'cls',
                  normalize: bool = False,
                  temperature: float = 1.0,
+                 *args,
+                 **kwargs,
                  ):
         super().__init__()
         self.config = encoder.config
