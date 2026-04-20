@@ -47,13 +47,14 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
 cd /home/thuy0050/code/vlmcl
 
 BASE_MODEL_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/models/colqwen3-base"
-MODEL_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/colpali_cl/1epoch_arxiv_qa_inbatchneg"
-LORAS_NAME_OR_PATH="" # $MODEL_NAME_OR_PATH/checkpoint-311 # /lora_paths.txt
+MODEL_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/dev"
+LORAS_NAME_OR_PATH=$MODEL_NAME_OR_PATH/checkpoint-375
 
-DATASET_NAME="vidore/arxivqa_test_subsampled_beir"
-QREL_PATH=/home/thuy0050/mg61_scratch2/thuy0050/data/vlmcl/$DATASET_NAME\_qrel.txt
+DATASET_NAME="LouisDo2108/marqo_gs_wfash_1m_test_subset_corpus_tevatron" # "LouisDo2108/marqo_gs_wfash_1m_tevatron"
+QREL_PATH="/home/thuy0050/mg61_scratch2/thuy0050/data/vlmcl/marqo/marqo_qrel_v2.txt"
+# "/home/thuy0050/mg61_scratch2/thuy0050/data/vlmcl/$DATASET_NAME\_qrel.txt"
 
-EXP_NAME="base_model_dev"
+EXP_NAME="dev"
 
 # "vidore/arxivqa_test_subsampled_beir"
 # "vidore/docvqa_test_subsampled_beir"
@@ -64,6 +65,25 @@ EXP_NAME="base_model_dev"
 OUTPUT_DIR=$MODEL_NAME_OR_PATH/out/$DATASET_NAME\_$EXP_NAME
 mkdir -p $OUTPUT_DIR
 
+# encode_num_shard=4
+# for i in $(seq 0 $((encode_num_shard-1)))
+# do
+#   echo "Encoding shard $(($i+1)) / $encode_num_shard"
+#   python src/tevatron/colpali/encode.py \
+#     --output_dir=$OUTPUT_DIR \
+#     --model_name_or_path "$BASE_MODEL_NAME_OR_PATH" \
+#     --lora_name_or_path "$LORAS_NAME_OR_PATH" \
+#     --bf16 \
+#     --dataset_name $DATASET_NAME \
+#     --dataset_split train \
+#     --per_device_eval_batch_size 128 \
+#     --dataloader_num_workers 8 \
+#     --dataset_number_of_shards $encode_num_shard \
+#     --dataset_shard_index $i \
+#     --embedding_projection True \
+#     --encode_output_path $OUTPUT_DIR/corpus.$i.pkl
+# done
+
 # python src/tevatron/colpali/encode.py \
 #   --output_dir=$OUTPUT_DIR \
 #   --model_name_or_path "$BASE_MODEL_NAME_OR_PATH" \
@@ -71,30 +91,16 @@ mkdir -p $OUTPUT_DIR
 #   --bf16 \
 #   --dataset_name $DATASET_NAME \
 #   --dataset_split test \
-#   --dataset_config corpus \
+#   --query_max_len 64 \
 #   --per_device_eval_batch_size 128 \
 #   --dataloader_num_workers 4 \
 #   --embedding_projection True \
-#   --encode_output_path $OUTPUT_DIR/corpus.pkl
-
-python src/tevatron/colpali/encode.py \
-  --output_dir=$OUTPUT_DIR \
-  --model_name_or_path "$BASE_MODEL_NAME_OR_PATH" \
-  --lora_name_or_path "$LORAS_NAME_OR_PATH" \
-  --bf16 \
-  --dataset_name $DATASET_NAME \
-  --dataset_split test \
-  --dataset_config queries \
-  --query_max_len 256 \
-  --per_device_eval_batch_size 128 \
-  --dataloader_num_workers 4 \
-  --embedding_projection False \
-  --encode_output_path $OUTPUT_DIR/query.pkl \
-  --encode_is_query
+#   --encode_output_path $OUTPUT_DIR/query.pkl \
+#   --encode_is_query
 
 # python src/tevatron/colpali/search.py \
 #     --query_reps $OUTPUT_DIR/query.pkl \
-#     --passage_reps $OUTPUT_DIR/corpus.pkl \
+#     --passage_reps "$OUTPUT_DIR/corpus.*.pkl" \
 #     --depth 100 \
 #     --batch_size 256 \
 #     --save_text \
@@ -105,7 +111,7 @@ python src/tevatron/colpali/encode.py \
 #   --input $OUTPUT_DIR/rank.txt \
 #   --output $OUTPUT_DIR/rank.trec
 
-# python -m pyserini.eval.trec_eval -c \
-#   -m recall.10,100 -m ndcg_cut.10 -M 100 \
-#   $QREL_PATH \
-#   $OUTPUT_DIR/rank.trec > $OUTPUT_DIR/out.txt 
+python -m pyserini.eval.trec_eval -c \
+  -m recall.10,100 -m ndcg_cut.10,100 -M 100 \
+  $QREL_PATH \
+  $OUTPUT_DIR/rank.trec > $OUTPUT_DIR/out_v2.txt

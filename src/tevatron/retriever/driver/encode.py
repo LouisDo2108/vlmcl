@@ -20,6 +20,7 @@ from tevatron.retriever.arguments import ModelArguments, DataArguments, \
 from tevatron.retriever.dataset import EncodeDataset
 from tevatron.retriever.collator import EncodeCollator
 from tevatron.retriever.modeling import EncoderOutput, DenseModel
+from transformers.utils.import_utils import is_flash_attn_2_available
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def main():
         lora_name_or_path=model_args.lora_name_or_path,
         cache_dir=model_args.cache_dir,
         torch_dtype=torch_dtype,
-        attn_implementation=model_args.attn_implementation,
+        attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa",,
     )
 
     encode_dataset = EncodeDataset(

@@ -1,4 +1,5 @@
 import pickle
+from pdb import set_trace as st
 
 import numpy as np
 import glob
@@ -54,6 +55,8 @@ def main():
     parser.add_argument('--quiet', action='store_true')
 
     args = parser.parse_args()
+    print("query reps path:", args.query_reps)
+    print("passage reps path:", args.passage_reps)
 
     q_reps, q_lookup = pickle_load(args.query_reps)
     q_reps = q_reps.to('cuda')

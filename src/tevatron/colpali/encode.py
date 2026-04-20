@@ -3,24 +3,24 @@ import os
 import pickle
 import sys
 from contextlib import nullcontext
-from pdb import set_trace as st
 from pathlib import Path
+from pdb import set_trace as st
 
 import numpy as np
 import torch
 from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
-from tevatron.colpali.models import ColQwen3, ColQwen3Processor, DenseModel
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model, get_model_status
+from peft import LoraConfig, PeftModel, TaskType, get_model_status, get_peft_model
 from tevatron.colpali.arguments import DataArguments, ModelArguments
 from tevatron.colpali.arguments import TevatronTrainingArguments as TrainingArguments
 from tevatron.colpali.collator import EncodeCollator
 from tevatron.colpali.dataset import EncodeDataset, EncodeICLRDataset
-from tevatron.colpali.models import DenseModel
+from tevatron.colpali.models import ColQwen3, ColQwen3Processor, DenseModel
 from tevatron.retriever.modeling.encoder import EncoderOutput
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import HfArgumentParser
 from transformers.utils.import_utils import is_flash_attn_2_available
+
 # from tevatron.colpali.index import save_colbert_index
 
 logger = logging.getLogger(__name__)
@@ -86,8 +86,9 @@ def main():
         )
         return lora_model
 
-    lora_paths = None
-    if Path(model_args.lora_name_or_path).suffix == ".txt":
+    if model_args.lora_name_or_path == "":
+        lora_model = base_model
+    elif Path(model_args.lora_name_or_path).suffix == ".txt":
         # Read the list of lora paths
         with open(model_args.lora_name_or_path) as f:
             lora_paths = f.readlines()
@@ -128,6 +129,7 @@ def main():
     model = DenseModel(
         encoder=lora_model,
     )
+    # model.encoder = torch.compile(model.encoder)
 
     encode_dataset = EncodeDataset(
         data_args=data_args,
@@ -151,22 +153,20 @@ def main():
     model = model.to(training_args.device)
     model.eval()
     
+    dtype = torch.float16 if training_args.fp16 else torch.bfloat16
+    context = torch.autocast("cuda", dtype=dtype) if training_args.fp16 or training_args.bf16 else nullcontext()
+    
+    print("Encoding with dtype:", dtype)
+
     for ix, (batch_ids, batch) in enumerate(tqdm(encode_loader)):
         lookup_indices.extend(batch_ids)
-        with (
-            torch.autocast(
-                "cuda", dtype=torch.float16 if training_args.fp16 else torch.bfloat16
-            )
-            if training_args.fp16 or training_args.bf16
-            else nullcontext()
-        ):
+        with context:
             with torch.no_grad():
                 for k, v in batch.items():
                     if v is not None:
                         batch[k] = v.to(training_args.device)
                     
                 if data_args.encode_is_query:
-                    
                     model_output: EncoderOutput = model(
                         query=batch, 
                         embedding_projection=training_args.embedding_projection

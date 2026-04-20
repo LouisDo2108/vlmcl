@@ -16,8 +16,8 @@ from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from tevatron.colpali.arguments import DataArguments, ModelArguments
 from tevatron.colpali.arguments import TevatronTrainingArguments as TrainingArguments
 from tevatron.colpali.collator import TrainCollator
-from tevatron.colpali.dataset import TrainDataset
-from tevatron.colpali.losses import ColbertLoss
+from tevatron.colpali.dataset import TrainDataset, TrainRankedDataset
+# from tevatron.colpali.losses import ColbertLoss
 from tevatron.colpali.models import ColQwen3, ColQwen3Processor, DenseModel
 from tevatron.colpali.trainer import Trainer
 from tevatron.colpali.utils import get_params_info, init, write_json
@@ -110,7 +110,7 @@ def main():
     print("*"*50)
     pprint(training_args)
 
-    train_dataset = TrainDataset(data_args)
+    train_dataset = TrainRankedDataset(data_args)
     
     # eval_args = deepcopy(data_args)
     # eval_args.dataset_name = "vidore/colpali_train_set"

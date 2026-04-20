@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from colpali_engine.utils.processing_utils import BaseVisualRetrieverProcessor
 from peft import LoraConfig
 from PIL import Image
-from tevatron.colpali.losses import ColbertLoss
+# from tevatron.colpali.losses import ColbertLoss
 from tevatron.colpali.utils import get_params_info, init, set_seed, write_json
 from tevatron.retriever.modeling.encoder import EncoderModel, EncoderOutput
 from torch import Tensor, nn
@@ -19,6 +19,7 @@ from transformers import BatchEncoding, BatchFeature
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.models.qwen3_vl import Qwen3VLConfig, Qwen3VLModel, Qwen3VLProcessor
 from transformers.utils.import_utils import is_flash_attn_2_available
+from tevatron.colpali.losses import neuralNDCG, neuralNDCG_transposed
 
 
 class DenseModel(EncoderModel):
@@ -186,70 +187,44 @@ class DenseModel(EncoderModel):
 
         # for inference
         if q_reps is None or p_reps is None:
-            return EncoderOutput(
-                q_reps=q_reps,
-                p_reps=p_reps
-            )
+            return EncoderOutput(q_reps=q_reps, p_reps=p_reps)
 
         # for training
         if self.training:
             if self.is_ddp:
                 q_reps = self._dist_gather_tensor(q_reps)
                 p_reps = self._dist_gather_tensor(p_reps)
-                
-            # scores, loss = self.loss_func(
-            #     query_embeddings=q_reps,
-            #     doc_embeddings=p_reps,
-            #     offset=0,
-            # )
-            target = None
-            row_idx = None
-            no_filter_mask = None
-            num_neg = p_reps.size(0) // q_reps.size(0)
 
+            bs = q_reps.size(0)
+            device = q_reps.device
+            num_neg = p_reps.size(0) // bs
             scores = self.compute_similarity(q_reps, p_reps)
-            scores = scores.view(q_reps.size(0), -1)
+            scores = scores.view(bs, -1)
 
-            # target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
-            # target = target * (p_reps.size(0) // q_reps.size(0))
-            
-            # Create useful masks for calculating different losses
-            # Which will be reused later on
-            if target is None:
-                target, row_idx, no_filter_mask = self.get_index_and_masks(num_neg, scores)
+            # 3. Indexing & Masking
+            target, row_idx, no_filter_mask = self.get_index_and_masks(num_neg, scores)
 
-            # (Optional) Filter potential false negatives by filtering samples with simialrty greater than 95% compared to the ground truth
+            # 4. Optional False Negative Filtering
             if self.filter_false_negatives:
-                scores = self.mask_inbatch_negative_percentile(scores, target, row_idx, no_filter_mask, percentile=0.95)
-            
+                scores = self.mask_inbatch_negative_percentile(
+                    scores, target, row_idx, no_filter_mask, percentile=0.95
+                )
+                
             if self.pairwise_ce_loss:
-                top2 = scores.topk(2, dim=1).values
-                pos_scores = scores[row_idx, target]
-                neg_scores = torch.where(top2[:, 0] == pos_scores, top2[:, 1], top2[:, 0])
-                
-                loss_pairwise_ce = F.softplus((neg_scores - pos_scores) / self.temperature).mean()
-                
-                if self.pairwise_inbatch_neg_loss:
-                    loss_infonce_w_inbatch_neg = self.compute_loss(scores / self.temperature, target)
-                    loss = (1 - self.pairwise_inbatch_neg_loss_weight) * loss_pairwise_ce + self.pairwise_inbatch_neg_loss_weight * loss_infonce_w_inbatch_neg
-                    losses = {
-                        "loss": loss,
-                        "total_loss": loss.clone().detach(),
-                        "loss_infonce_w_inbatch_neg": self.pairwise_inbatch_neg_loss_weight * loss_infonce_w_inbatch_neg.clone().detach(),
-                        "loss_pairwise_ce": (1 - self.pairwise_inbatch_neg_loss_weight) * loss_pairwise_ce.clone().detach(),
-                    }
-                else:
-                    loss = loss_pairwise_ce
-                    losses = {
-                        "loss": loss,
-                        "loss_pairwise_ce": loss.clone().detach(),
-                    }
+                # Pairwise CE loss with optional in-batch negatives InfoNCE loss
+                return self._calc_pairwise_ce_loss(scores, target, row_idx)
             else:
-                # Normal in-batch negatives with optional annotated hard negatives InfoNCE loss
+                # Normal in-batch negatives InfoNCE loss with optional annotated hard negatives
                 loss = self.compute_loss(scores / self.temperature, target)
+                ndcgloss = neuralNDCG_transposed(
+                    y_pred=scores.gather(1, no_filter_mask),
+                    y_true=torch.arange(num_neg, device=device, dtype=torch.float32).expand(bs, -1), 
+                    device=device
+                )
                 losses = {
-                    "loss": loss,
+                    "loss": loss + ndcgloss,
                     "infonce_loss": loss.clone().detach(),
+                    "ndcg_loss": ndcgloss.clone().detach(),
                 }
             
             # if self.is_ddp:
@@ -257,7 +232,7 @@ class DenseModel(EncoderModel):
             return losses
         # for eval
         else:
-            scores = self.compute_similarity(q_reps, p_reps) # self.loss_func.compute_similarity(q_reps, p_reps, offset=0)
+            scores = self.compute_similarity(q_reps, p_reps)
             loss = None
             return EncoderOutput(
                 loss=loss,
@@ -265,6 +240,34 @@ class DenseModel(EncoderModel):
                 q_reps=q_reps,
                 p_reps=p_reps,
             )
+            
+    def _calc_pairwise_ce_loss(self, scores: Tensor, target: Tensor, row_idx: Tensor) -> dict:
+        """Calculates Pairwise CE loss, optionally mixed with InfoNCE."""
+        top2 = scores.topk(2, dim=1).values
+        pos_scores = scores[row_idx, target]
+        
+        # Determine neg scores: if top1 is positive, take top2; else take top1
+        neg_scores = torch.where(top2[:, 0] == pos_scores, top2[:, 1], top2[:, 0])
+        
+        loss_pairwise_ce = F.softplus((neg_scores - pos_scores) / self.temperature).mean()
+        
+        if self.pairwise_inbatch_neg_loss:
+            loss_infonce = self.compute_loss(scores / self.temperature, target)
+
+            weight = self.pairwise_inbatch_neg_loss_weight
+            loss = (1 - weight) * loss_pairwise_ce + weight * loss_infonce
+            
+            return {
+                "loss": loss,
+                "total_loss": loss.clone().detach(),
+                "loss_infonce_w_inbatch_neg": weight * loss_infonce.clone().detach(),
+                "loss_pairwise_ce": (1 - weight) * loss_pairwise_ce.clone().detach(),
+            }
+        else:
+            return {
+                "loss": loss_pairwise_ce,
+                "loss_pairwise_ce": loss_pairwise_ce.clone().detach(),
+            }
 
 
 class ColQwen3Processor(BaseVisualRetrieverProcessor, Qwen3VLProcessor):

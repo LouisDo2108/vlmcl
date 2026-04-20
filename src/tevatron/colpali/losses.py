@@ -1,474 +1,292 @@
 import torch
 import torch.nn.functional as F
-from torch.nn import CrossEntropyLoss
-from pdb import set_trace as st
+import numpy as np
 
-class ColbertModule(torch.nn.Module):
+PADDED_Y_VALUE = -1
+DEFAULT_EPS = 1e-10
+
+# Source: https://github.com/allegro/allRank/tree/master
+
+def sinkhorn_scaling(mat, mask=None, tol=1e-6, max_iter=50):
     """
-    Base module for ColBERT losses, handling shared utilities and hyperparameters.
-
-    Args:
-        max_batch_size (int): Maximum batch size for pre-allocating index buffer.
-        tau (float): Temperature for smooth-max approximation.
-        norm_tol (float): Tolerance for score normalization bounds.
-        filter_threshold (float): Ratio threshold for pos-aware negative filtering.
-        filter_factor (float): Multiplicative factor to down-weight high negatives.
+    Sinkhorn scaling procedure.
+    :param mat: a tensor of square matrices of shape N x M x M, where N is batch size
+    :param mask: a tensor of masks of shape N x M
+    :param tol: Sinkhorn scaling tolerance
+    :param max_iter: maximum number of iterations of the Sinkhorn scaling
+    :return: a tensor of (approximately) doubly stochastic matrices
     """
+    if mask is not None:
+        mat = mat.masked_fill(mask[:, None, :] | mask[:, :, None], 0.0)
+        mat = mat.masked_fill(mask[:, None, :] & mask[:, :, None], 1.0)
 
-    def __init__(
-        self,
-        max_batch_size: int = 1024,
-        tau: float = 0.1,
-        norm_tol: float = 1e-3,
-        filter_threshold: float = 0.95,
-        filter_factor: float = 0.5,
-    ):
-        super().__init__()
-        self.register_buffer("idx_buffer", torch.arange(max_batch_size), persistent=False)
-        self.tau = tau
-        self.norm_tol = norm_tol
-        self.filter_threshold = filter_threshold
-        self.filter_factor = filter_factor
+    for _ in range(max_iter):
+        mat = mat / mat.sum(dim=1, keepdim=True).clamp(min=DEFAULT_EPS)
+        mat = mat / mat.sum(dim=2, keepdim=True).clamp(min=DEFAULT_EPS)
 
-    def _get_idx(self, batch_size: int, offset: int, device: torch.device):
-        """
-        Retrieve index and positive index tensors for in-batch losses.
-        """
-        idx = self.idx_buffer[:batch_size].to(device)
-        return idx, idx + offset
+        if torch.max(torch.abs(mat.sum(dim=2) - 1.)) < tol and torch.max(torch.abs(mat.sum(dim=1) - 1.)) < tol:
+            break
 
-    def _smooth_max(self, scores: torch.Tensor, dim: int) -> torch.Tensor:
-        """
-        Compute smooth max via log-sum-exp along a given dimension.
-        """
-        return self.tau * torch.logsumexp(scores / self.tau, dim=dim)
+    if mask is not None:
+        mat = mat.masked_fill(mask[:, None, :] | mask[:, :, None], 0.0)
 
-    def _apply_normalization(self, scores: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize scores by query lengths and enforce bounds.
-
-        Args:
-            scores (Tensor): Unnormalized score matrix [B, C].
-            lengths (Tensor): Query lengths [B].
-
-        Returns:
-            Tensor: Normalized scores.
-
-        Raises:
-            ValueError: If normalized scores exceed tolerance.
-        """
-        if scores.ndim == 2:
-            normalized = scores / lengths.unsqueeze(1)
-        else:
-            normalized = scores / lengths
-
-        mn, mx = torch.aminmax(normalized)
-        if mn < -self.norm_tol or mx > 1 + self.norm_tol:
-            print(
-                f"Scores out of bounds after normalization: "
-                f"min={mn.item():.4f}, max={mx.item():.4f}, tol={self.norm_tol}"
-            )
-        return normalized
-
-    def _aggregate(
-        self,
-        scores_raw: torch.Tensor,
-        use_smooth_max: bool,
-        dim_max: int,
-        dim_sum: int,
-    ) -> torch.Tensor:
-        """
-        Aggregate token-level scores into document-level.
-
-        Args:
-            scores_raw (Tensor): Raw scores tensor.
-            use_smooth_max (bool): Use smooth-max if True.
-            dim_max (int): Dimension to perform max/logsumexp.
-            dim_sum (int): Dimension to sum over after max.
-        """
-        if use_smooth_max:
-            return self._smooth_max(scores_raw, dim=dim_max).sum(dim=dim_sum)
-        return scores_raw.amax(dim=dim_max).sum(dim=dim_sum)
-
-    def _filter_high_negatives(self, scores: torch.Tensor, pos_idx: torch.Tensor) -> None:
-        """
-        Down-weight negatives whose score exceeds a fraction of the positive score.
-
-        Args:
-            scores (Tensor): In-batch score matrix [B, B].
-            pos_idx (Tensor): Positive indices for each query in batch.
-        """
-        batch_size = scores.size(0)
-        idx = self.idx_buffer[:batch_size].to(scores.device)
-        pos_scores = scores[idx, pos_idx]
-        thresh = self.filter_threshold * pos_scores.unsqueeze(1)
-        mask = scores > thresh
-        mask[idx, pos_idx] = False
-        scores[mask] *= self.filter_factor
+    return mat
 
 
-class ColbertLoss(ColbertModule):
+def deterministic_neural_sort(s, tau, mask, device):
     """
-    InfoNCE loss for late interaction (ColBERT) without explicit negatives.
-
-    Args:
-        temperature (float): Scaling factor for logits.
-        normalize_scores (bool): Normalize scores by query lengths.
-        use_smooth_max (bool): Use log-sum-exp instead of amax.
-        pos_aware_negative_filtering (bool): Apply pos-aware negative filtering.
+    Deterministic neural sort.
+    Code taken from "Stochastic Optimization of Sorting Networks via Continuous Relaxations", ICLR 2019.
+    Minor modifications applied to the original code (masking).
+    :param s: values to sort, shape [batch_size, slate_length]
+    :param tau: temperature for the final softmax function
+    :param mask: mask indicating padded elements
+    :return: approximate permutation matrices of shape [batch_size, slate_length, slate_length]
     """
+    dev = device
 
-    def __init__(
-        self,
-        temperature: float = 0.02,
-        normalize_scores: bool = True,
-        use_smooth_max: bool = False,
-        pos_aware_negative_filtering: bool = False,
-        max_batch_size: int = 1024,
-        tau: float = 0.1,
-        norm_tol: float = 1e-3,
-        filter_threshold: float = 0.95,
-        filter_factor: float = 0.5,
-    ):
-        super().__init__(max_batch_size, tau, norm_tol, filter_threshold, filter_factor)
-        self.temperature = temperature
-        self.normalize_scores = normalize_scores
-        self.use_smooth_max = use_smooth_max
-        self.pos_aware_negative_filtering = pos_aware_negative_filtering
-        self.ce_loss = CrossEntropyLoss()
-        
-    def compute_similarity(self, query_embeddings, doc_embeddings, offset):
-        lengths = (query_embeddings[:, :, 0] != 0).sum(dim=1)
-        raw = torch.einsum("bnd,csd->bcns", query_embeddings, doc_embeddings)
-        scores = self._aggregate(raw, self.use_smooth_max, dim_max=3, dim_sum=2)
-        if self.normalize_scores:
-            scores = self._apply_normalization(scores, lengths)
-        return scores
+    n = s.size()[1]
+    one = torch.ones((n, 1), dtype=torch.float32, device=device)
+    s = s.masked_fill(mask[:, :, None], -1e8)
+    A_s = torch.abs(s - s.permute(0, 2, 1))
+    A_s = A_s.masked_fill(mask[:, :, None] | mask[:, None, :], 0.0)
 
-    def forward(self, query_embeddings: torch.Tensor, doc_embeddings: torch.Tensor, offset: int = 0): #-> torch.Tensor:
-        """
-        Compute ColBERT InfoNCE loss over a batch of queries and documents.
+    B = torch.matmul(A_s, torch.matmul(one, torch.transpose(one, 0, 1)))
 
-        Args:
-            query_embeddings (Tensor): (batch_size, query_length, dim)
-            doc_embeddings (Tensor): positive docs (batch_size, pos_doc_length, dim)
-            offset (int): Offset for positive doc indices (multi-GPU).
+    temp = [n - m + 1 - 2 * (torch.arange(n - m, device=dev) + 1) for m in mask.squeeze(-1).sum(dim=1)]
+    temp = [t.type(torch.float32) for t in temp]
+    temp = [torch.cat((t, torch.zeros(n - len(t), device=dev))) for t in temp]
+    scaling = torch.stack(temp).type(torch.float32).to(dev)  # type: ignore
 
-        Returns:
-            Tensor: Scalar loss value.
-        """
-        lengths = (query_embeddings[:, :, 0] != 0).sum(dim=1)
+    s = s.masked_fill(mask[:, :, None], 0.0)
+    C = torch.matmul(s, scaling.unsqueeze(-2))
 
-        raw = torch.einsum("bnd,csd->bcns", query_embeddings, doc_embeddings)
-        scores = self._aggregate(raw, self.use_smooth_max, dim_max=3, dim_sum=2)
-        if self.normalize_scores:
-            scores = self._apply_normalization(scores, lengths)
-
-        batch_size = scores.size(0)
-        idx, pos_idx = self._get_idx(batch_size, offset, scores.device)
-
-        if self.pos_aware_negative_filtering:
-            self._filter_high_negatives(scores, pos_idx)
-
-        return scores, self.ce_loss(scores / self.temperature, pos_idx)
+    P_max = (C - B).permute(0, 2, 1)
+    P_max = P_max.masked_fill(mask[:, :, None] | mask[:, None, :], -np.inf)
+    P_max = P_max.masked_fill(mask[:, :, None] & mask[:, None, :], 1.0)
+    sm = torch.nn.Softmax(-1)
+    P_hat = sm(P_max / tau)
+    return P_hat
 
 
-class ColbertNegativeCELoss(ColbertModule):
+def sample_gumbel(samples_shape, device, eps=1e-10) -> torch.Tensor:
     """
-    InfoNCE loss with explicit negative documents.
-
-    Args:
-        temperature (float): Scaling for logits.
-        normalize_scores (bool): Normalize scores by query lengths.
-        use_smooth_max (bool): Use log-sum-exp instead of amax.
-        pos_aware_negative_filtering (bool): Apply pos-aware negative filtering.
-        in_batch_term_weight (float): Add in-batch CE term (between 0 and 1).
+    Sampling from Gumbel distribution.
+    Code taken from "Stochastic Optimization of Sorting Networks via Continuous Relaxations", ICLR 2019.
+    Minor modifications applied to the original code (masking).
+    :param samples_shape: shape of the output samples tensor
+    :param device: device of the output samples tensor
+    :param eps: epsilon for the logarithm function
+    :return: Gumbel samples tensor of shape samples_shape
     """
-
-    def __init__(
-        self,
-        temperature: float = 0.02,
-        normalize_scores: bool = True,
-        use_smooth_max: bool = False,
-        pos_aware_negative_filtering: bool = False,
-        in_batch_term_weight: float = 0.5,
-        max_batch_size: int = 1024,
-        tau: float = 0.1,
-        norm_tol: float = 1e-3,
-        filter_threshold: float = 0.95,
-        filter_factor: float = 0.5,
-    ):
-        super().__init__(max_batch_size, tau, norm_tol, filter_threshold, filter_factor)
-        self.temperature = temperature
-        self.normalize_scores = normalize_scores
-        self.use_smooth_max = use_smooth_max
-        self.pos_aware_negative_filtering = pos_aware_negative_filtering
-        self.in_batch_term_weight = in_batch_term_weight
-        self.ce_loss = CrossEntropyLoss()
-
-        assert in_batch_term_weight >= 0, "in_batch_term_weight must be non-negative"
-        assert in_batch_term_weight <= 1, "in_batch_term_weight must be less than 1"
-
-        self.inner_loss = ColbertLoss(
-            temperature=temperature,
-            normalize_scores=normalize_scores,
-            use_smooth_max=use_smooth_max,
-            pos_aware_negative_filtering=pos_aware_negative_filtering,
-            max_batch_size=max_batch_size,
-            tau=tau,
-            norm_tol=norm_tol,
-            filter_threshold=filter_threshold,
-            filter_factor=filter_factor,
-        )
-
-    def forward(
-        self,
-        query_embeddings: torch.Tensor,
-        doc_embeddings: torch.Tensor,
-        neg_doc_embeddings: torch.Tensor,
-        offset: int = 0,
-    ) -> torch.Tensor:
-        """
-        Compute InfoNCE loss with explicit negatives and optional in-batch term.
-
-        Args:
-            query_embeddings (Tensor): (batch_size, query_length, dim)
-            doc_embeddings (Tensor): positive docs (batch_size, pos_doc_length, dim)
-            neg_doc_embeddings (Tensor): negative docs (batch_size, num_negs, neg_doc_length, dim)
-            offset (int): Positional offset for in-batch CE.
-
-        Returns:
-            Tensor: Scalar loss.
-        """
-        lengths = (query_embeddings[:, :, 0] != 0).sum(dim=1)
-        pos_raw = torch.einsum(
-            "bnd,bsd->bns", query_embeddings, doc_embeddings[offset : offset + neg_doc_embeddings.size(0)]
-        )
-        neg_raw = torch.einsum("bnd,blsd->blns", query_embeddings, neg_doc_embeddings)
-        pos_scores = self._aggregate(pos_raw, self.use_smooth_max, dim_max=2, dim_sum=1)
-        neg_scores = self._aggregate(neg_raw, self.use_smooth_max, dim_max=3, dim_sum=2)
-
-        if self.normalize_scores:
-            pos_scores = self._apply_normalization(pos_scores, lengths)
-            neg_scores = self._apply_normalization(neg_scores, lengths)
-
-        loss = F.softplus((neg_scores - pos_scores.unsqueeze(1)) / self.temperature).mean()
-
-        if self.in_batch_term_weight > 0:
-            loss_ib = self.inner_loss(query_embeddings, doc_embeddings, offset)
-            loss = loss * (1 - self.in_batch_term_weight) + loss_ib * self.in_batch_term_weight
-
-        return loss
+    U = torch.rand(samples_shape, device=device)
+    return -torch.log(-torch.log(U + eps) + eps)
 
 
-class ColbertPairwiseCELoss(ColbertModule):
+def stochastic_neural_sort(s, n_samples, tau, mask, device, beta=1.0, log_scores=True, eps=1e-10):
     """
-    Pairwise loss for ColBERT (no explicit negatives).
-
-    Args:
-        temperature (float): Scaling for logits.
-        normalize_scores (bool): Normalize scores by query lengths.
-        use_smooth_max (bool): Use log-sum-exp instead of amax.
-        pos_aware_negative_filtering (bool): Apply pos-aware negative filtering.
+    Stochastic neural sort. Please note that memory complexity grows by factor n_samples.
+    Code taken from "Stochastic Optimization of Sorting Networks via Continuous Relaxations", ICLR 2019.
+    Minor modifications applied to the original code (masking).
+    :param s: values to sort, shape [batch_size, slate_length]
+    :param n_samples: number of samples (approximations) for each permutation matrix
+    :param tau: temperature for the final softmax function
+    :param mask: mask indicating padded elements
+    :param beta: scale parameter for the Gumbel distribution
+    :param log_scores: whether to apply the logarithm function to scores prior to Gumbel perturbation
+    :param eps: epsilon for the logarithm function
+    :return: approximate permutation matrices of shape [n_samples, batch_size, slate_length, slate_length]
     """
+    dev = device
 
-    def __init__(
-        self,
-        temperature: float = 1.0,
-        normalize_scores: bool = True,
-        use_smooth_max: bool = False,
-        pos_aware_negative_filtering: bool = False,
-        max_batch_size: int = 1024,
-        tau: float = 0.1,
-        norm_tol: float = 1e-3,
-        filter_threshold: float = 0.95,
-        filter_factor: float = 0.5,
-    ):
-        super().__init__(max_batch_size, tau, norm_tol, filter_threshold, filter_factor)
-        self.temperature = temperature
-        self.normalize_scores = normalize_scores
-        self.use_smooth_max = use_smooth_max
-        self.pos_aware_negative_filtering = pos_aware_negative_filtering
+    batch_size = s.size()[0]
+    n = s.size()[1]
+    s_positive = s + torch.abs(s.min())
+    samples = beta * sample_gumbel([n_samples, batch_size, n, 1], device=dev)
+    if log_scores:
+        s_positive = torch.log(s_positive + eps)
 
-    def forward(self, query_embeddings: torch.Tensor, doc_embeddings: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        """
-        Compute pairwise softplus loss over in-batch document pairs.
+    s_perturb = (s_positive + samples).view(n_samples * batch_size, n, 1)
+    mask_repeated = mask.repeat_interleave(n_samples, dim=0)
 
-        Args:
-            query_embeddings (Tensor): (batch_size, query_length, dim)
-            doc_embeddings (Tensor): positive docs (batch_size, pos_doc_length, dim)
-            offset (int): Positional offset for positives.
-
-        Returns:
-            Tensor: Scalar loss value.
-        """
-        lengths = (query_embeddings[:, :, 0] != 0).sum(dim=1)
-        raw = torch.einsum("bnd,csd->bcns", query_embeddings, doc_embeddings)
-        scores = self._aggregate(raw, self.use_smooth_max, dim_max=3, dim_sum=2)
-
-        if self.normalize_scores:
-            scores = self._apply_normalization(scores, lengths)
-
-        batch_size = scores.size(0)
-        idx, pos_idx = self._get_idx(batch_size, offset, scores.device)
-
-        if self.pos_aware_negative_filtering:
-            self._filter_high_negatives(scores, pos_idx)
-
-        pos_scores = scores.diagonal(offset=offset)
-        top2 = scores.topk(2, dim=1).values
-        neg_scores = torch.where(top2[:, 0] == pos_scores, top2[:, 1], top2[:, 0])
-
-        return F.softplus((neg_scores - pos_scores) / self.temperature).mean()
+    P_hat = deterministic_neural_sort(s_perturb, tau, mask_repeated, device=dev)
+    P_hat = P_hat.view(n_samples, batch_size, n, n)
+    return P_hat
 
 
-class ColbertPairwiseNegativeCELoss(ColbertModule):
+def __apply_mask_and_get_true_sorted_by_preds(y_pred, y_true, padding_indicator=PADDED_Y_VALUE):
+    mask = y_true == padding_indicator
+
+    y_pred[mask] = float('-inf')
+    y_true[mask] = 0.0
+
+    _, indices = y_pred.sort(descending=True, dim=-1)
+    return torch.gather(y_true, dim=1, index=indices)
+
+
+def dcg(y_pred, y_true, ats=None, gain_function=lambda x: torch.pow(2, x) - 1, padding_indicator=PADDED_Y_VALUE):
     """
-    Pairwise loss with explicit negatives and optional in-batch term.
+    Discounted Cumulative Gain at k.
 
-    Args:
-        temperature (float): Scaling for logits.
-        normalize_scores (bool): Normalize scores by query lengths.
-        use_smooth_max (bool): Use log-sum-exp instead of amax.
-        pos_aware_negative_filtering (bool): Apply pos-aware negative filtering.
-        in_batch_term_weight (float): Add in-batch CE term (between 0 and 1).
+    Compute DCG at ranks given by ats or at the maximum rank if ats is None.
+    :param y_pred: predictions from the model, shape [batch_size, slate_length]
+    :param y_true: ground truth labels, shape [batch_size, slate_length]
+    :param ats: optional list of ranks for DCG evaluation, if None, maximum rank is used
+    :param gain_function: callable, gain function for the ground truth labels, e.g. torch.pow(2, x) - 1
+    :param padding_indicator: an indicator of the y_true index containing a padded item, e.g. -1
+    :return: DCG values for each slate and evaluation position, shape [batch_size, len(ats)]
     """
+    y_true = y_true.clone()
+    y_pred = y_pred.clone()
 
-    def __init__(
-        self,
-        temperature: float = 0.02,
-        normalize_scores: bool = True,
-        use_smooth_max: bool = False,
-        pos_aware_negative_filtering: bool = False,
-        in_batch_term_weight: float = 0.5,
-        max_batch_size: int = 1024,
-        tau: float = 0.1,
-        norm_tol: float = 1e-3,
-        filter_threshold: float = 0.95,
-        filter_factor: float = 0.5,
-    ):
-        super().__init__(max_batch_size, tau, norm_tol, filter_threshold, filter_factor)
-        self.temperature = temperature
-        self.normalize_scores = normalize_scores
-        self.use_smooth_max = use_smooth_max
-        self.pos_aware_negative_filtering = pos_aware_negative_filtering
-        self.in_batch_term_weight = in_batch_term_weight
-        assert in_batch_term_weight >= 0, "in_batch_term_weight must be non-negative"
-        assert in_batch_term_weight <= 1, "in_batch_term_weight must be less than 1"
-        self.inner_pairwise = ColbertPairwiseCELoss(
-            temperature=temperature,
-            normalize_scores=normalize_scores,
-            use_smooth_max=use_smooth_max,
-            pos_aware_negative_filtering=pos_aware_negative_filtering,
-            max_batch_size=max_batch_size,
-            tau=tau,
-            norm_tol=norm_tol,
-            filter_threshold=filter_threshold,
-            filter_factor=filter_factor,
-        )
+    actual_length = y_true.shape[1]
 
-    def forward(
-        self,
-        query_embeddings: torch.Tensor,
-        doc_embeddings: torch.Tensor,
-        neg_doc_embeddings: torch.Tensor,
-        offset: int = 0,
-    ) -> torch.Tensor:
-        """
-        Compute pairwise softplus loss with explicit negatives and optional in-batch term.
+    if ats is None:
+        ats = [actual_length]
+    ats = [min(at, actual_length) for at in ats]
 
-        Args:
-            query_embeddings (Tensor): (batch_size, query_length, dim)
-            doc_embeddings (Tensor): positive docs (batch_size, pos_doc_length, dim)
-            neg_doc_embeddings (Tensor): negative docs (batch_size, num_negs, neg_doc_length, dim)
-            offset (int): Positional offset for positives.
+    true_sorted_by_preds = __apply_mask_and_get_true_sorted_by_preds(y_pred, y_true, padding_indicator)
 
-        Returns:
-            Tensor: Scalar loss value.
-        """
-        lengths = (query_embeddings[:, :, 0] != 0).sum(dim=1)
-        pos_raw = torch.einsum(
-            "bnd,bld->bnl", query_embeddings, doc_embeddings[offset : offset + query_embeddings.size(0)]
-        )
-        neg_raw = torch.einsum("bnd,bsld->bsnl", query_embeddings, neg_doc_embeddings)  # B x Nneg x Nq x Lneg
-        pos_scores = self._aggregate(pos_raw, self.use_smooth_max, dim_max=2, dim_sum=1)
-        neg_scores = self._aggregate(neg_raw, self.use_smooth_max, dim_max=3, dim_sum=2)
+    discounts = (torch.tensor(1) / torch.log2(torch.arange(true_sorted_by_preds.shape[1], dtype=torch.float) + 2.0)).to(
+        device=true_sorted_by_preds.device)
 
-        if self.normalize_scores:
-            pos_scores = self._apply_normalization(pos_scores, lengths)
-            neg_scores = self._apply_normalization(neg_scores, lengths)
+    gains = gain_function(true_sorted_by_preds)
 
-        loss = F.softplus((neg_scores - pos_scores.unsqueeze(1)) / self.temperature).mean()
+    discounted_gains = (gains * discounts)[:, :np.max(ats)]
 
-        if self.in_batch_term_weight > 0:
-            loss_ib = self.inner_pairwise(query_embeddings, doc_embeddings, offset)
-            loss = loss * (1 - self.in_batch_term_weight) + loss_ib * self.in_batch_term_weight
+    cum_dcg = torch.cumsum(discounted_gains, dim=1)
 
-        return loss
+    ats_tensor = torch.tensor(ats, dtype=torch.long) - torch.tensor(1)
+
+    dcg = cum_dcg[:, ats_tensor]
+
+    return dcg
 
 
-class ColbertSigmoidLoss(ColbertModule):
+def neuralNDCG(y_pred, y_true, padded_value_indicator=PADDED_Y_VALUE, temperature=1., powered_relevancies=True, k=None,
+               stochastic=False, n_samples=32, beta=0.1, log_scores=True, device=torch.device("cuda")):
     """
-    Sigmoid loss for ColBERT with explicit negatives.
-
-    Args:
-        temperature (float): Scaling for logits.
-        normalize_scores (bool): Normalize scores by query lengths.
-        use_smooth_max (bool): Use log-sum-exp instead of amax.
-        pos_aware_negative_filtering (bool): Apply pos-aware negative filtering.
+    NeuralNDCG loss introduced in "NeuralNDCG: Direct Optimisation of a Ranking Metric via Differentiable
+    Relaxation of Sorting" - https://arxiv.org/abs/2102.07831. Based on the NeuralSort algorithm.
+    :param y_pred: predictions from the model, shape [batch_size, slate_length]
+    :param y_true: ground truth labels, shape [batch_size, slate_length]
+    :param padded_value_indicator: an indicator of the y_true index containing a padded item, e.g. -1
+    :param temperature: temperature for the NeuralSort algorithm
+    :param powered_relevancies: whether to apply 2^x - 1 gain function, x otherwise
+    :param k: rank at which the loss is truncated
+    :param stochastic: whether to calculate the stochastic variant
+    :param n_samples: how many stochastic samples are taken, used if stochastic == True
+    :param beta: beta parameter for NeuralSort algorithm, used if stochastic == True
+    :param log_scores: log_scores parameter for NeuralSort algorithm, used if stochastic == True
+    :return: loss value, a torch.Tensor
     """
+    dev = device
 
-    def __init__(
-        self,
-        temperature: float = 0.02,
-        normalize_scores: bool = True,
-        use_smooth_max: bool = False,
-        pos_aware_negative_filtering: bool = False,
-        max_batch_size: int = 1024,
-        tau: float = 0.1,
-        norm_tol: float = 1e-3,
-        filter_threshold: float = 0.95,
-        filter_factor: float = 0.5,
-    ):
-        super().__init__(max_batch_size, tau, norm_tol, filter_threshold, filter_factor)
-        self.temperature = temperature
-        self.normalize_scores = normalize_scores
-        self.use_smooth_max = use_smooth_max
-        self.pos_aware_negative_filtering = pos_aware_negative_filtering
-        self.ce_loss = CrossEntropyLoss()
+    if k is None:
+        k = y_true.shape[1]
 
-    def forward(self, query_embeddings: torch.Tensor, doc_embeddings: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        """
-        Compute sigmoid loss over positive and negative document pairs.
+    mask = (y_true == padded_value_indicator)
+    # Choose the deterministic/stochastic variant
+    if stochastic:
+        P_hat = stochastic_neural_sort(y_pred.unsqueeze(-1), device=device, n_samples=n_samples, tau=temperature, mask=mask,
+                                       beta=beta, log_scores=log_scores)
+    else:
+        P_hat = deterministic_neural_sort(y_pred.unsqueeze(-1), tau=temperature, mask=mask, device=device).unsqueeze(0)
 
-        Args:
-            query_embeddings (Tensor): (batch_size, query_length, dim)
-            doc_embeddings (Tensor): positive docs (batch_size, pos_doc_length, dim)
+    # Perform sinkhorn scaling to obtain doubly stochastic permutation matrices
+    P_hat = sinkhorn_scaling(P_hat.view(P_hat.shape[0] * P_hat.shape[1], P_hat.shape[2], P_hat.shape[3]),
+                             mask.repeat_interleave(P_hat.shape[0], dim=0), tol=1e-6, max_iter=50)
+    P_hat = P_hat.view(int(P_hat.shape[0] / y_pred.shape[0]), y_pred.shape[0], P_hat.shape[1], P_hat.shape[2])
 
-        Returns:
-            Tensor: Scalar loss value.
-        """
+    # Mask P_hat and apply to true labels, ie approximately sort them
+    P_hat = P_hat.masked_fill(mask[None, :, :, None] | mask[None, :, None, :], 0.)
+    y_true_masked = y_true.masked_fill(mask, 0.).unsqueeze(-1).unsqueeze(0)
+    if powered_relevancies:
+        y_true_masked = torch.pow(2., y_true_masked) - 1.
 
-        lengths = (query_embeddings[:, :, 0] != 0).sum(dim=1)
-        raw = torch.einsum("bnd,csd->bcns", query_embeddings, doc_embeddings)
-        scores = self._aggregate(raw, self.use_smooth_max, dim_max=3, dim_sum=2)
+    ground_truth = torch.matmul(P_hat, y_true_masked).squeeze(-1)
+    discounts = (torch.tensor(1.) / torch.log2(torch.arange(y_true.shape[-1], dtype=torch.float) + 2.)).to(dev)
+    discounted_gains = ground_truth * discounts
 
-        if self.normalize_scores:
-            scores = self._apply_normalization(scores, lengths)
+    if powered_relevancies:
+        idcg = dcg(y_true, y_true, ats=[k]).permute(1, 0)
+    else:
+        idcg = dcg(y_true, y_true, ats=[k], gain_function=lambda x: x).permute(1, 0)
 
-        batch_size = scores.size(0)
-        idx, pos_idx = self._get_idx(batch_size, offset, scores.device)
+    discounted_gains = discounted_gains[:, :, :k]
+    ndcg = discounted_gains.sum(dim=-1) / (idcg + DEFAULT_EPS)
+    idcg_mask = idcg == 0.
+    ndcg = ndcg.masked_fill(idcg_mask.repeat(ndcg.shape[0], 1), 0.)
 
-        if self.pos_aware_negative_filtering:
-            self._filter_high_negatives(scores, pos_idx)
+    assert (ndcg < 0.).sum() >= 0, "every ndcg should be non-negative"
+    if idcg_mask.all():
+        return torch.tensor(0.)
 
-        # for each idx in pos_idx, the 2D index (idx, idx) → flat index = idx * B + idx
-        # build a 1-D mask of length B*B with ones at those positions
-        flat_pos = pos_idx * (batch_size + 1)
-        pos_mask = -torch.ones(batch_size * batch_size, device=scores.device)
-        pos_mask[flat_pos] = 1.0
+    mean_ndcg = ndcg.sum() / ((~idcg_mask).sum() * ndcg.shape[0])  # type: ignore
+    return -1. * mean_ndcg  # -1 cause we want to maximize NDCG
 
-        # flatten the scores to [B * B]
-        scores = scores.view(-1) / self.temperature
 
-        return F.softplus(-scores * pos_mask).mean()
+def neuralNDCG_transposed(y_pred, y_true, padded_value_indicator=PADDED_Y_VALUE, temperature=1.,
+                          powered_relevancies=True, k=None, stochastic=False, n_samples=32, beta=0.1, log_scores=True,
+                          max_iter=50, tol=1e-6, device=torch.device("cuda")):
+    """
+    NeuralNDCG Transposed loss introduced in "NeuralNDCG: Direct Optimisation of a Ranking Metric via Differentiable
+    Relaxation of Sorting" - https://arxiv.org/abs/2102.07831. Based on the NeuralSort algorithm.
+    :param y_pred: predictions from the model, shape [batch_size, slate_length]
+    :param y_true: ground truth labels, shape [batch_size, slate_length]
+    :param padded_value_indicator: an indicator of the y_true index containing a padded item, e.g. -1
+    :param temperature: temperature for the NeuralSort algorithm
+    :param powered_relevancies: whether to apply 2^x - 1 gain function, x otherwise
+    :param k: rank at which the loss is truncated
+    :param stochastic: whether to calculate the stochastic variant
+    :param n_samples: how many stochastic samples are taken, used if stochastic == True
+    :param beta: beta parameter for NeuralSort algorithm, used if stochastic == True
+    :param log_scores: log_scores parameter for NeuralSort algorithm, used if stochastic == True
+    :param max_iter: maximum iteration count for Sinkhorn scaling
+    :param tol: tolerance for Sinkhorn scaling
+    :return: loss value, a torch.Tensor
+    """
+    dev = device
+
+    if k is None:
+        k = y_true.shape[1]
+
+    mask = (y_true == padded_value_indicator)
+
+    if stochastic:
+        P_hat = stochastic_neural_sort(y_pred.unsqueeze(-1), device=device,  n_samples=n_samples, tau=temperature, mask=mask,
+                                       beta=beta, log_scores=log_scores)
+    else:
+        P_hat = deterministic_neural_sort(y_pred.unsqueeze(-1), tau=temperature, mask=mask, device=device).unsqueeze(0)
+
+    # Perform sinkhorn scaling to obtain doubly stochastic permutation matrices
+    P_hat_masked = sinkhorn_scaling(P_hat.view(P_hat.shape[0] * y_pred.shape[0], y_pred.shape[1], y_pred.shape[1]),
+                                    mask.repeat_interleave(P_hat.shape[0], dim=0), tol=tol, max_iter=max_iter)
+    P_hat_masked = P_hat_masked.view(P_hat.shape[0], y_pred.shape[0], y_pred.shape[1], y_pred.shape[1])
+    discounts = (torch.tensor(1) / torch.log2(torch.arange(y_true.shape[-1], dtype=torch.float) + 2.)).to(dev)
+
+    # This takes care of the @k metric truncation - if something is @>k, it is useless and gets 0.0 discount
+    discounts[k:] = 0.
+    discounts = discounts[None, None, :, None]
+
+    # Here the discounts become expected discounts
+    discounts = torch.matmul(P_hat_masked.permute(0, 1, 3, 2), discounts).squeeze(-1)
+    if powered_relevancies:
+        gains = torch.pow(2., y_true) - 1
+        discounted_gains = gains.unsqueeze(0) * discounts
+        idcg = dcg(y_true, y_true, ats=[k]).squeeze()
+    else:
+        gains = y_true
+        discounted_gains = gains.unsqueeze(0) * discounts
+        idcg = dcg(y_true, y_true, ats=[k]).squeeze()
+
+    ndcg = discounted_gains.sum(dim=2) / (idcg + DEFAULT_EPS)
+    idcg_mask = idcg == 0.
+    ndcg = ndcg.masked_fill(idcg_mask, 0.)
+
+    assert (ndcg < 0.).sum() >= 0, "every ndcg should be non-negative"
+    if idcg_mask.all():
+        return torch.tensor(0.)
+
+    mean_ndcg = ndcg.sum() / ((~idcg_mask).sum() * ndcg.shape[0])  # type: ignore
+    return -1. * mean_ndcg  # -1 cause we want to maximize NDCG

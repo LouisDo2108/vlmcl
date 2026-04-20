@@ -1,6 +1,7 @@
 import logging
 from dataclasses import dataclass
 from typing import List, Tuple
+from pdb import set_trace as st
 
 import torch
 from qwen_vl_utils import process_vision_info
@@ -46,6 +47,7 @@ class TrainCollator:
         passage_messages = []
         for idx in range(len(all_passages)):
             image = all_passages[idx]
+            # TODO: we can optionally remove "describe the image" if there are "title" for each image.
             message = [
                 {
                     'role': 'user',
@@ -148,7 +150,6 @@ class EncodeCollator:
                 max_length=max_length, # Ensure padding to max length
                 return_tensors="pt",
             )
-            print(query_inputs['input_ids'].shape)
             return content_ids, query_inputs
         else:
             passage_messages = []
