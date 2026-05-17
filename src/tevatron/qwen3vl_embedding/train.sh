@@ -46,27 +46,27 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
 
 cd /home/thuy0050/code/vlmcl
 
-OUTPUT_DIR="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/colpali_cl/test" # 1epoch_arxiv_qa_inbatchneg"
+OUTPUT_DIR="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/qwen3vl_embedding_no_lora_attention_output_r=8_3epochs"
 mkdir -p $OUTPUT_DIR
 
-# accelerate launch 
-python src/tevatron/colpali/train.py \
-  --model_name_or_path "/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/models/colqwen3-base" \
+python src/tevatron/qwen3vl_embedding/train.py \
+  --model_name_or_path "Qwen/Qwen3-VL-Embedding-2B" \
   --dataset_name "tevatron/colpali" \
   --dataset_split "train" \
   --corpus_name "tevatron/colpali-corpus" \
   --corpus_split "train" \
+  --gradient_accumulation_steps 1 \
   --gradient_checkpointing \
   --learning_rate 1e-4 \
   --per_device_train_batch_size 32 \
   --train_group_size 4 \
   --logging_steps 10 \
   --dataloader_num_workers 8 \
-  --num_train_epochs 1 \
+  --num_train_epochs 3 \
   --colpali_source "arxiv_qa" \
-  --output_dir $OUTPUT_DIR \
-  > $OUTPUT_DIR/out.txt
+  --output_dir $OUTPUT_DIR > $OUTPUT_DIR/out.txt
 
+# bash /home/thuy0050/code/vlmcl/src/tevatron/qwen3vl_embedding/encode.sh
 
 # OUTPUT_DIR="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/colpali_cl/1epoch_docvqa_inbatchneg_after_arxiv_qa"
 # LORA_NAME_OR_PATH="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/colpali_cl/1epoch_arxiv_qa_inbatchneg/checkpoint-311"

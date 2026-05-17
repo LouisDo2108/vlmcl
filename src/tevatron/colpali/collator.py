@@ -29,7 +29,7 @@ class TrainCollator:
         all_passages = []
         for f in features:
             all_passages.extend(f[1])
-        
+            
         query_messages = []
         for query in all_queries:
             message = [
@@ -109,7 +109,7 @@ class EncodeCollator:
     data_args: DataArguments
     processor: ProcessorMixin
 
-    def __call__(self, features: List[Tuple[str, str]]):
+    def __call__(self, features):
         """
         Collate function for encoding.
         :param features: list of (id, text) tuples

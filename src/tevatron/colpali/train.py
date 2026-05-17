@@ -110,7 +110,7 @@ def main():
     print("*"*50)
     pprint(training_args)
 
-    train_dataset = TrainRankedDataset(data_args)
+    train_dataset = TrainDataset(data_args) # TrainRankedDataset(data_args)
     
     # eval_args = deepcopy(data_args)
     # eval_args.dataset_name = "vidore/colpali_train_set"

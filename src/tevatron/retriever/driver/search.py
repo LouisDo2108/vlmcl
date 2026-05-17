@@ -41,7 +41,7 @@ def write_ranking(corpus_indices, corpus_scores, q_lookup, ranking_save_file):
 def pickle_load(path):
     with open(path, 'rb') as f:
         reps, lookup = pickle.load(f)
-    return np.array(reps), lookup
+    return np.asarray(reps), lookup
 
 
 def pickle_save(obj, path):

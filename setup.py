@@ -11,8 +11,8 @@ setup(
     author_email='luyug@cs.cmu.edu',
     description='Tevatron: A toolkit for learning and running deep dense retrieval models.',
     python_requires='>=3.7',
-    install_requires=[
-        "transformers>=4.10.0",
-        "datasets>=1.1.3"
-    ]
+    # install_requires=[
+    #     "transformers>=4.10.0",
+    #     "datasets>=1.1.3"
+    # ]
 )
