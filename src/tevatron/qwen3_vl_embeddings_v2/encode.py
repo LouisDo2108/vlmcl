@@ -11,7 +11,7 @@ Usage:
     python -m src.tevatron.qwen3_vl_embeddings_v2.encode \
         --output_dir <output_dir> \
         --model_name_or_path <model_path> \
-        --data <data_path> \
+        --dataset_name <dataset_name> \
         --batch_size <batch_size> \
         --fp16
 """
@@ -26,18 +26,18 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import HfArgumentParser
 
-from .arguments import Qwen3VLDataArguments, Qwen3VLModelArguments, Qwen3VLTrainingArguments
-from .dataset import Qwen3VLEvalDataset
-from .modeling_qwen3_vl import Qwen3VLForEmbedding
-from .collator import Qwen3VLEvalCollator
+from .arguments import ModelArguments, DataArguments, TevatronTrainingArguments
+from .dataset import EncodeDataset
+from .models import Qwen3VLForEmbedding, Qwen3VLProcessor
+from .collator import EncodeCollator
 
 logger = logging.getLogger(__name__)
 
 
 def run_encoding(
-    model_args: Qwen3VLModelArguments,
-    data_args: Qwen3VLDataArguments,
-    training_args: Qwen3VLTrainingArguments,
+    model_args: ModelArguments,
+    data_args: DataArguments,
+    training_args: TevatronTrainingArguments,
 ) -> None:
     """
     Run the encoding process to generate embeddings.
@@ -55,30 +55,41 @@ def run_encoding(
     )
     logger.warning(f"Process rank: {training_args.local_rank}, device: {training_args.device}")
 
-    # Load model
+    # Load model and processor
     logger.info(f"Loading model from {model_args.model_name_or_path}")
     model = Qwen3VLForEmbedding.from_pretrained(
         model_args.model_name_or_path,
-        config_name=model_args.config_name,
-        cache_dir=model_args.cache_dir,
-        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        dtype=torch.bfloat16 if training_args.bf16 else torch.float32,
+        trust_remote_code=True,
     )
+    
+    processor = Qwen3VLProcessor.from_pretrained(
+        model_args.model_name_or_path,
+        padding_side='right',
+    )
+    
+    # Configure image processor
+    patch_size = getattr(processor.image_processor, "patch_size", None)
+    merge_size = getattr(processor.image_processor, "merge_size", None)
+    
+    if patch_size is None or merge_size is None:
+        raise ValueError(
+            "Qwen3VL image processor is missing `patch_size` or `merge_size`."
+        )
+    
+    tile = patch_size * merge_size
+    processor.image_processor.max_pixels = 768 * tile * tile
+    processor.image_processor.size["longest_edge"] = processor.image_processor.max_pixels
+    
     model.to(training_args.device)
     model.eval()
 
     # Load dataset
-    logger.info(f"Loading dataset from {data_args.data}")
-    dataset = Qwen3VLEvalDataset(
-        data_path=data_args.data,
-        processor_name_or_path=model_args.model_name_or_path,
-        max_len=data_args.max_len,
-    )
+    logger.info(f"Loading dataset from {data_args.dataset_name}")
+    dataset = EncodeDataset(data_args=data_args)
 
     # Collator
-    collator = Qwen3VLEvalCollator(
-        processor=dataset.processor,
-        max_length=data_args.max_len,
-    )
+    collator = EncodeCollator(data_args=data_args)
 
     # DataLoader
     data_loader = DataLoader(
@@ -98,11 +109,19 @@ def run_encoding(
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Encoding", disable=not training_args.is_local_process_zero()):
             # Move batch to device
-            batch_inputs = {k: v.to(training_args.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            if isinstance(batch, dict):
+                batch_inputs = {
+                    k: v.to(training_args.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()
+                }
+            else:
+                # Handle tuple output from collator (content_ids, messages)
+                content_ids, messages = batch
+                batch_inputs = messages
 
-            # Forward pass
-            outputs = model(**batch_inputs)
-            embeddings = outputs.embeddings  # type: ignore[attr-defined]
+            # Forward pass through embedder
+            outputs = model.encode(messages=batch_inputs)
+            embeddings = outputs
 
             # Normalize embeddings if required
             if model_args.normalize:
@@ -111,11 +130,9 @@ def run_encoding(
             # Collect results
             all_embeddings.append(embeddings.cpu())
             
-            # Extract doc IDs if available
-            if "doc_id" in batch:
-                all_doc_ids.extend(batch["doc_id"])
-            elif "_id" in batch:
-                all_doc_ids.extend(batch["_id"])
+            # Collect doc IDs
+            if isinstance(batch, tuple) and len(batch) == 2:
+                all_doc_ids.extend(batch[0])
 
     # Concatenate results
     if all_embeddings:
@@ -146,7 +163,7 @@ def run_encoding(
 
 def main():
     """Main entry point for the encoding script."""
-    parser = HfArgumentParser((Qwen3VLModelArguments, Qwen3VLDataArguments, Qwen3VLTrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataArguments, TevatronTrainingArguments))
     
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
