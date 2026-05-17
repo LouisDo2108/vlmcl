@@ -14,13 +14,10 @@ Usage:
 
 import logging
 import os
-import sys
-from dataclasses import asdict
 from copy import deepcopy
+from dataclasses import asdict
 
 import torch
-from transformers import set_seed
-from transformers.trainer_utils import get_last_checkpoint
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers.utils.import_utils import is_flash_attn_2_available
 
@@ -37,24 +34,9 @@ logger = logging.getLogger(__name__)
 
 def main():
     """Main training function."""
-    # Parse arguments
+    # Parse arguments using the shared init helper
     model_args, data_args, training_args = init(
         ModelArguments, DataArguments, TevatronTrainingArguments
-    )
-    
-    # Set random seed for reproducibility
-    set_seed(training_args.seed)
-    
-    # Initialize logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
-    )
-    
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, "
-        f"n_gpu: {training_args.n_gpu}, distributed training: {bool(training_args.local_rank != -1)}"
     )
     
     # Load model and processor
@@ -141,18 +123,10 @@ def main():
     
     train_dataset.set_trainer(trainer)
     
-    # Check for existing checkpoint
-    last_checkpoint = None
-    if os.path.isdir(training_args.output_dir):
-        last_checkpoint = get_last_checkpoint(training_args.output_dir)
-    
     # Start training
-    logger.info("Starting training")
-    trainer.train(resume_from_checkpoint=(last_checkpoint is not None))
+    trainer.train()
     
     # Save final model and configurations
-    logger.info("Saving final model and configurations")
-    
     training_args_to_save = asdict(deepcopy(training_args))
     training_args_to_save.update(asdict(model_args))
     training_args_to_save.update(asdict(data_args))
@@ -163,8 +137,6 @@ def main():
     )
     
     processor.save_pretrained(training_args.output_dir)
-    
-    logger.info(f"Training completed. Model saved to {training_args.output_dir}")
 
 
 if __name__ == "__main__":
