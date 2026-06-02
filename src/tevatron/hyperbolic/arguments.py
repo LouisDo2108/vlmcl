@@ -1,9 +1,9 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from tevatron.retriever.arguments import DataArguments as TevatronDataArguments
 from tevatron.retriever.arguments import ModelArguments as TevatronModelArguments
-from tevatron.retriever.arguments import TrainingArguments as TevatronTrainingArguments
+from tevatron.retriever.arguments import TevatronTrainingArguments
 
 
 @dataclass
@@ -51,3 +51,9 @@ class TrainingArguments(TevatronTrainingArguments):
     )
     gc_q_chunk_size: int = field(default=4, metadata={"help": "GradCache query chunk size"})
     gc_p_chunk_size: int = field(default=4, metadata={"help": "GradCache target chunk size"})
+    report_to: Union[None, str, list[str]] = field(
+        default=None,
+        metadata={
+            "help": "The list of integrations to report the results and logs to."
+        },
+    )

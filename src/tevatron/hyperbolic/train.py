@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 
 from tevatron.hyperbolic.arguments import (
@@ -16,6 +17,19 @@ from transformers import CLIPProcessor
 logger = logging.getLogger(__name__)
 
 
+def _maybe_enable_wandb(training_args):
+    """Enable wandb logging with minimal friction."""
+    report_to = training_args.report_to
+
+    if report_to == "none" or report_to == []:
+        return
+
+    training_args.report_to = "wandb"
+    os.environ.setdefault("WANDB_WATCH", "false")
+    os.environ.setdefault("WANDB_LOG_MODEL", "false")
+    print_master("Enabled wandb logging via training_args.report_to=wandb.")
+
+
 def load_clip_processor(model_args):
     model_name = model_args.processor_name or model_args.model_name_or_path
     print_master(f"Loading CLIPProcessor from {model_name}")
@@ -30,9 +44,8 @@ def main():
             sys.argv.extend(["--local_rank", rank])
 
     # Sets up logging, prints training/model/data args, and seeds RNGs.
-    model_args, data_args, training_args = init(
-        ModelArguments, DataArguments, TrainingArguments
-    )
+    model_args, data_args, training_args = init(ModelArguments, DataArguments, TrainingArguments)
+    _maybe_enable_wandb(training_args)
 
     processor = load_clip_processor(model_args)
     model = CLIPContrastiveModel.build(model_args)

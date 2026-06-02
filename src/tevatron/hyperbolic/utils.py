@@ -19,8 +19,6 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tevatron.retriever.arguments import DataArguments, ModelArguments
-from tevatron.retriever.arguments import TevatronTrainingArguments as TrainingArguments
 from transformers.hf_argparser import HfArgumentParser
 from transformers.utils.import_utils import is_torch_available
 
@@ -210,9 +208,9 @@ def init(model_args_cls, data_args_cls, training_args_cls):
         )
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        model_args: model_args_cls
-        data_args: data_args_cls
-        training_args: training_args_cls
+        model_args: model_args_cls  # type: ignore
+        data_args: data_args_cls  # type: ignore
+        training_args: training_args_cls  # type: ignore
 
     if (
         os.path.exists(training_args.output_dir)
