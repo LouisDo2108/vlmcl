@@ -1,0 +1,76 @@
+#!/bin/bash
+
+## FOR PARTITION GPU, A100
+##SBATCH --partition=gpu
+##SBATCH --gres=gpu:A100:1
+##SBATCH --nodelist=m3n100,m3n101,m3n102,m3n103,m3n104,m3n105,m3n106,m3n107,m3n108,m3n109,m3n110,m3n111,m3n112
+
+## FOR PARTITION GPU, L40S
+## SBATCH --partition=gpu
+## SBATCH --gres=gpu:L40S:1
+
+## FOR FIT PARTITION
+#SBATCH --partition=fit
+#SBATCH --nodelist=m3u000,m3u001,m3u002,m3u003,m3u004,m3u005,m3u006,m3u007,m3u008
+#SBATCH --gres=gpu:A100:1
+#SBATCH --qos=fitq
+
+#SBATCH --account=mg61
+#SBATCH --job-name=thuy0050
+#SBATCH --output=/home/thuy0050/mg61_scratch2/thuy0050/exp/tevatron/logs/temporal/slurm-%x-%j.out
+#SBATCH --error=/home/thuy0050/mg61_scratch2/thuy0050/exp/tevatron/logs/temporal/slurm-%x-%j.err
+#SBATCH --time=1-00:00:00
+
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=256G
+
+#SBATCH --mail-user=tuan.huynh1@monash.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
+
+# ==== ENVIRONMENT SETUP ====
+source ~/.bashrc
+mamba activate colpali
+
+export CUDA_VISIBLE_DEVICES=0
+# export PYTORCH_ALLOC_CONF=max_split_size_mb:512
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
+# export TQDM_DISABLE=1 # Avoid logging tqdm progress bars
+# export TORCH_USE_CUDA_DSA=0 # Set to 1 only if debugging
+# export CUDA_LAUNCH_BLOCKING=0 # Set to 1 only if debugging
+
+# Useful for pytorch debugging: torch.autograd.set_detect_anomaly(True)
+
+cd /home/thuy0050/code/vlmcl
+
+OUTPUT_DIR="/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/dev"
+LORA_NAME_OR_PATH="" # "/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/colqwen3_tevatron/1epoch_arxiv_qa_inbatchneg/checkpoint-311"
+mkdir -p $OUTPUT_DIR
+
+python src/tevatron/colpali/train.py \
+  --model_name_or_path "/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/models/colqwen3-base" \
+  --lora_name_or_path "$LORA_NAME_OR_PATH" \
+  --dataset_name "LouisDo2108/marqo_gs_wfash_1m_tevatron" \
+  --dataset_split "train" \
+  --corpus_name "LouisDo2108/marqo_gs_wfash_1m_corpus_tevatron" \
+  --corpus_split "train" \
+  --learning_rate 1e-4 \
+  --per_device_train_batch_size 4 \
+  --train_group_size 1 \
+  --logging_steps 1 \
+  --dataloader_num_workers 0 \
+  --num_train_epochs 1 \
+  --output_dir $OUTPUT_DIR
+
+# "LouisDo2108/marqo_gs_wfash_1m_tevatron"
+# "LouisDo2108/marqo_gs_wfash_1m_corpus_tevatron"
+  # > $OUTPUT_DIR/out.txt
+# --num_train_epochs 1 \
+# --eval_strategy="steps" \
+# --eval_steps=1 \
+# --dataloader_num_workers 8 \
+# --pairwise_ce_loss \
+# --pairwise_inbatch_neg_loss \

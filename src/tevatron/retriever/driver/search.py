@@ -1,15 +1,14 @@
-import pickle
-
-import numpy as np
 import glob
+import logging
+import pickle
 from argparse import ArgumentParser
 from itertools import chain
-from tqdm import tqdm
+
 import faiss
-
+import numpy as np
 from tevatron.retriever.searcher import FaissFlatSearcher
+from tqdm import tqdm
 
-import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",

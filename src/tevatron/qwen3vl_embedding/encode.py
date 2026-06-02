@@ -1,72 +1,86 @@
 import logging
-import sys
-import torch
 import pickle
-from pathlib import Path
+import sys
 from dataclasses import asdict
-from transformers import AutoTokenizer
-from transformers import (
-    HfArgumentParser,
-    set_seed,
-)
-from transformers.trainer_utils import get_last_checkpoint
+from pathlib import Path
+
+import torch
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from tevatron.colpali.utils import get_params_info, init, write_json
 
 # from tevatron.retriever.arguments import ModelArguments, DataArguments, \
 #     TevatronTrainingArguments as TrainingArguments
 # from tevatron.retriever.dataset import TrainDataset
 # from tevatron.retriever.collator import TrainCollator
 from tevatron.qwen3vl_embedding.arguments import DataArguments, ModelArguments
-from tevatron.qwen3vl_embedding.arguments import TevatronTrainingArguments as TrainingArguments
-from tevatron.colpali.utils import get_params_info, init, write_json
-from transformers.utils.import_utils import is_flash_attn_2_available
-from tevatron.qwen3vl_embedding.collator import TrainCollator, EncodeCollator
-from tevatron.qwen3vl_embedding.dataset import TrainDataset, EncodeDataset, TrainRankedDataset
+from tevatron.qwen3vl_embedding.arguments import (
+    TevatronTrainingArguments as TrainingArguments,
+)
+from tevatron.qwen3vl_embedding.collator import EncodeCollator, TrainCollator
+from tevatron.qwen3vl_embedding.dataset import (  # TrainRankedDataset,
+    EncodeDataset,
+    TrainDataset,
+)
+from tevatron.qwen3vl_embedding.models import *
 from tevatron.qwen3vl_embedding.models import DenseModel
 from tevatron.qwen3vl_embedding.trainer import Trainer
-from tqdm.auto import tqdm
+
 # from tevatron.retriever.modeling import DenseModel
 # from tevatron.retriever.trainer import TevatronTrainer as Trainer
 from tevatron.retriever.gc_trainer import GradCacheTrainer as GCTrainer
-from tevatron.qwen3vl_embedding.models import *
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, HfArgumentParser, set_seed
+from transformers.trainer_utils import get_last_checkpoint
+from transformers.utils.import_utils import is_flash_attn_2_available
 
 logger = logging.getLogger(__name__)
 
 
 def main():
-    model_args, data_args, training_args = init(ModelArguments, DataArguments, TrainingArguments)
+    model_args, data_args, training_args = init(
+        ModelArguments, DataArguments, TrainingArguments
+    )
 
     base_model = Qwen3VLForEmbedding.from_pretrained(
         model_args.model_name_or_path,
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa",
+        attn_implementation=(
+            "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+        ),
         trust_remote_code=True,
     )
     processor = Qwen3VLProcessor.from_pretrained(
-        model_args.model_name_or_path, padding_side='right'
+        model_args.model_name_or_path, padding_side="right"
     )
     patch_size = getattr(processor.image_processor, "patch_size", None)
     merge_size = getattr(processor.image_processor, "merge_size", None)
     if patch_size is None or merge_size is None:
-        raise ValueError("Qwen3VL image processor is missing `patch_size` or `merge_size`.")
+        raise ValueError(
+            "Qwen3VL image processor is missing `patch_size` or `merge_size`."
+        )
 
     tile = patch_size * merge_size
     processor.image_processor.max_pixels = 768 * tile * tile
-    processor.image_processor.size["longest_edge"] = processor.image_processor.max_pixels
+    processor.image_processor.size["longest_edge"] = (
+        processor.image_processor.max_pixels
+    )
 
     def load_lora_model(lora_name_or_path, base_model):
         print(f"Loading LoRA from {lora_name_or_path}")
         lora_config = LoraConfig.from_pretrained(
             lora_name_or_path,
             dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "sdpa",
-            trust_remote_code=True
+            attn_implementation=(
+                "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+            ),
+            trust_remote_code=True,
         )
         lora_model = PeftModel.from_pretrained(
-            base_model, lora_name_or_path, 
-            config=lora_config, 
-            adapter_name=lora_name_or_path
+            base_model,
+            lora_name_or_path,
+            config=lora_config,
+            adapter_name=lora_name_or_path,
         )
         return lora_model
 
@@ -91,18 +105,19 @@ def main():
         # Load the remaining LoRAs in the list
         for lora_path in lora_paths[1:]:
             print(f"Loading LoRA from {lora_path}")
-            lora_model.load_adapter(
-                lora_path, 
-                adapter_name=lora_path
-            )
+            lora_model.load_adapter(lora_path, adapter_name=lora_path)
             # lora_model.set_adapter(lora_path.strip())
             # print(lora_model.active_adapter)
             # print(get_model_status(lora_model).available_adapters)
 
         lora_model = lora_model.merge_and_unload(
-            progressbar=True, 
-            adapter_names=lora_paths if lora_paths is not None else [model_args.lora_name_or_path.strip()]
-        ) # type: ignore
+            progressbar=True,
+            adapter_names=(
+                lora_paths
+                if lora_paths is not None
+                else [model_args.lora_name_or_path.strip()]
+            ),
+        )  # type: ignore
 
         # Another way but with worse performance
         # lora_model.add_weighted_adapter([x.strip() for x in lora_paths], [1.0]*len(lora_paths), "merge", combination_type="linear")
@@ -137,7 +152,11 @@ def main():
     model.eval()
 
     dtype = torch.float16 if training_args.fp16 else torch.bfloat16
-    context = torch.autocast("cuda", dtype=dtype) if training_args.fp16 or training_args.bf16 else nullcontext()
+    context = (
+        torch.autocast("cuda", dtype=dtype)
+        if training_args.fp16 or training_args.bf16
+        else nullcontext()
+    )
 
     print("Encoding with dtype:", dtype)
 
@@ -158,10 +177,11 @@ def main():
 
     encoded = torch.cat(encoded, dim=0)
 
-    with open(data_args.encode_output_path, 'wb') as f:
+    with open(data_args.encode_output_path, "wb") as f:
         pickle.dump((encoded, lookup_indices), f)
 
     print(f"Writting embeddings to {data_args.encode_output_path}")
+
 
 if __name__ == "__main__":
     main()

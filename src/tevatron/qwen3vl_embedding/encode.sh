@@ -64,33 +64,33 @@ QREL_PATH=/home/thuy0050/mg61_scratch2/thuy0050/data/vlmcl/$DATASET_NAME\_qrel.t
 OUTPUT_DIR=$MODEL_NAME_OR_PATH/out/$DATASET_NAME #$EXP_NAME
 mkdir -p $OUTPUT_DIR
 
-python src/tevatron/qwen3vl_embedding/encode.py \
-  --output_dir=$OUTPUT_DIR \
-  --model_name_or_path "$BASE_MODEL_NAME_OR_PATH" \
-  --lora_name_or_path "$LORAS_NAME_OR_PATH" \
-  --bf16 \
-  --dataset_name $DATASET_NAME \
-  --dataset_split test \
-  --dataset_config corpus \
-  --per_device_eval_batch_size 64 \
-  --dataloader_num_workers 4 \
-  --embedding_projection True \
-  --encode_output_path $OUTPUT_DIR/corpus.pkl
+# python src/tevatron/qwen3vl_embedding/encode.py \
+#   --output_dir=$OUTPUT_DIR \
+#   --model_name_or_path "$BASE_MODEL_NAME_OR_PATH" \
+#   --lora_name_or_path "$LORAS_NAME_OR_PATH" \
+#   --bf16 \
+#   --dataset_name $DATASET_NAME \
+#   --dataset_split test \
+#   --dataset_config corpus \
+#   --per_device_eval_batch_size 64 \
+#   --dataloader_num_workers 4 \
+#   --embedding_projection True \
+#   --encode_output_path $OUTPUT_DIR/corpus.pkl
 
-python src/tevatron/qwen3vl_embedding/encode.py \
-  --output_dir=$OUTPUT_DIR \
-  --model_name_or_path "$BASE_MODEL_NAME_OR_PATH" \
-  --lora_name_or_path "$LORAS_NAME_OR_PATH" \
-  --bf16 \
-  --dataset_name $DATASET_NAME \
-  --dataset_split test \
-  --dataset_config queries \
-  --query_max_len 256 \
-  --per_device_eval_batch_size 64 \
-  --dataloader_num_workers 4 \
-  --embedding_projection False \
-  --encode_output_path $OUTPUT_DIR/query.pkl \
-  --encode_is_query
+# python src/tevatron/qwen3vl_embedding/encode.py \
+#   --output_dir=$OUTPUT_DIR \
+#   --model_name_or_path "$BASE_MODEL_NAME_OR_PATH" \
+#   --lora_name_or_path "$LORAS_NAME_OR_PATH" \
+#   --bf16 \
+#   --dataset_name $DATASET_NAME \
+#   --dataset_split test \
+#   --dataset_config queries \
+#   --query_max_len 256 \
+#   --per_device_eval_batch_size 64 \
+#   --dataloader_num_workers 4 \
+#   --embedding_projection False \
+#   --encode_output_path $OUTPUT_DIR/query.pkl \
+#   --encode_is_query
 
 python src/tevatron/retriever/driver/search.py \
     --query_reps $OUTPUT_DIR/query.pkl \

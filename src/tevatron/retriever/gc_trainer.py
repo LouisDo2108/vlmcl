@@ -1,13 +1,13 @@
 
-from itertools import repeat
-import torch
-from torch import Tensor
-from torch.nn import functional as F
-from torch import distributed as dist
-
-from tevatron.retriever.trainer import TevatronTrainer
-
 import logging
+from itertools import repeat
+
+import torch
+from tevatron.retriever.trainer import TevatronTrainer
+from torch import Tensor
+from torch import distributed as dist
+from torch.nn import functional as F
+
 logger = logging.getLogger(__name__)
 
 class SimpleContrastiveLoss:

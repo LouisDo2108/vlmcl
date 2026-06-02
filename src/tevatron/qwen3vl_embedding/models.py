@@ -1,81 +1,156 @@
-import os
-import torch
-import torch.nn.functional as F
-import unicodedata
-import numpy as np
+"""
+Models module for Qwen3 VL Embeddings V2.
+
+This module provides improved model implementations for multimodal embeddings
+using Qwen3-VL, following Tevatron framework conventions with enhanced code quality,
+better type hints, and modular design.
+"""
+
 import logging
-
-from PIL import Image
-from urllib.parse import urlparse
-from dataclasses import dataclass
-from typing import Optional, List, Union, Dict, Any
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLPreTrainedModel, Qwen3VLModel, Qwen3VLConfig
-from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
-from transformers.modeling_outputs import ModelOutput
-from transformers.processing_utils import Unpack
-from transformers.utils import TransformersKwargs
-from transformers.cache_utils import Cache
-from qwen_vl_utils.vision_process import process_vision_info
 import os
-from typing import Dict, List, Optional, Union
-
-import torch
-import torch.nn.functional as F
-from peft import LoraConfig
-from PIL import Image
-# from tevatron.colpali.losses import ColbertLoss
-from tevatron.retriever.modeling.encoder import EncoderModel, EncoderOutput
-from torch import Tensor, nn
-from transformers.models.qwen3_vl import Qwen3VLConfig, Qwen3VLModel, Qwen3VLProcessor
+import unicodedata
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
+import numpy as np
 import torch
 import torch.distributed as dist
-from torch import nn, Tensor
+import torch.nn as nn
+import torch.nn.functional as F
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from PIL import Image
+from qwen_vl_utils.vision_process import process_vision_info
+from tevatron.retriever.modeling.encoder import EncoderModel as TevatronEncoderModel
+from tevatron.retriever.modeling.encoder import EncoderOutput
+from transformers import AutoModel, PreTrainedModel
+from transformers.cache_utils import Cache
+from transformers.models.qwen3_vl import (
+    Qwen3VLConfig,
+    Qwen3VLModel,
+    Qwen3VLPreTrainedModel,
+    Qwen3VLProcessor,
+)
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs
 
-from transformers import PreTrainedModel, AutoModel
-from peft import LoraConfig, TaskType, get_peft_model, PeftModel
+from .arguments import DataArguments, ModelArguments
 
-from transformers.file_utils import ModelOutput
-from pdb import set_trace as st
+logger = logging.getLogger(__name__)
 
 
-# Constants for configuration
+# =============================================================================
+# Constants
+# =============================================================================
+
 MAX_LENGTH = 8192
 IMAGE_BASE_FACTOR = 16
 IMAGE_FACTOR = IMAGE_BASE_FACTOR * 2
 MIN_PIXELS = 4 * IMAGE_FACTOR * IMAGE_FACTOR
 MAX_PIXELS = 1800 * IMAGE_FACTOR * IMAGE_FACTOR
-FPS = 1
+FPS = 1.0
 MAX_FRAMES = 64
 FRAME_MAX_PIXELS = 768 * IMAGE_FACTOR * IMAGE_FACTOR
 MAX_TOTAL_PIXELS = 10 * FRAME_MAX_PIXELS
-PAD_TOKEN = "<|endoftext|>"
+PAD_TOKEN = ""
 
 
-logger = logging.getLogger(__name__)
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def sample_frames(
+    frames: List[Union[str, Image.Image]], 
+    max_segments: int
+) -> List[Union[str, Image.Image]]:
+    """
+    Sample frames from a video sequence using uniform sampling.
+    
+    Args:
+        frames: List of frame paths or PIL Images.
+        max_segments: Maximum number of frames to sample.
+        
+    Returns:
+        List of sampled frames.
+    """
+    duration = len(frames)
+    if duration <= max_segments:
+        return frames
+    
+    frame_indices = np.linspace(0, duration - 1, max_segments, dtype=int).tolist()
+    return [frames[idx] for idx in frame_indices]
+
+
+def is_image_path(path: str) -> bool:
+    """
+    Check if a string path points to an image file.
+    
+    Args:
+        path: File path or URL to check.
+        
+    Returns:
+        True if the path has an image extension, False otherwise.
+    """
+    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.svg'}
+    
+    if path.startswith(('http://', 'https://')):
+        parsed_url = urlparse(path)
+        clean_path = parsed_url.path
+    else:
+        clean_path = path
+    
+    _, ext = os.path.splitext(clean_path.lower())
+    return ext in image_extensions
+
+
+def is_video_input(video: Any) -> bool:
+    """
+    Determine if input represents a video.
+    
+    Args:
+        video: Input to check (string path, list of frames, etc.).
+        
+    Returns:
+        True if the input appears to be a video, False otherwise.
+    """
+    if isinstance(video, str):
+        return True
+    
+    if isinstance(video, list) and len(video) > 0:
+        first_elem = video[0]
+        if isinstance(first_elem, Image.Image):
+            return True
+        if isinstance(first_elem, str) and is_image_path(first_elem):
+            return True
+    
+    return False
+
+
+# =============================================================================
+# Base Encoder Model
+# =============================================================================
 
 class EncoderModel(nn.Module):
+    """
+    Base encoder model for retrieval tasks.
+    
+    This class provides common functionality for encoding queries and passages,
+    including distributed training support and contrastive loss computation.
+    """
+    
     TRANSFORMER_CLS = AutoModel
-
-    def __init__(self,
-                 encoder: PreTrainedModel,
-                 processor,
-                 pooling: str = 'cls',
-                 normalize: bool = False,
-                 temperature: float = 1.0,
-                 max_length: int = MAX_LENGTH,
-                 min_pixels: int = MIN_PIXELS,
-                 max_pixels: int = MAX_PIXELS,
-                 total_pixels: int = MAX_TOTAL_PIXELS,
-                 fps: float = FPS,
-                 max_frames: int = MAX_FRAMES,
-                 default_instruction: str = "Represent the user's input.",
-                 *args,
-                 **kwargs,
-                 ):
+    
+    def __init__(
+        self,
+        encoder: PreTrainedModel,
+        processor: Any,
+        pooling: str = 'cls',
+        normalize: bool = False,
+        temperature: float = 1.0,
+        max_length: int = MAX_LENGTH,
+    ):
         super().__init__()
+        
         self.config = encoder.model.config
         self.encoder = encoder
         self.processor = processor
@@ -83,100 +158,138 @@ class EncoderModel(nn.Module):
         self.normalize = normalize
         self.temperature = temperature
         self.cross_entropy = nn.CrossEntropyLoss(reduction='mean')
+        
+        # Distributed training setup
         self.is_ddp = dist.is_initialized()
         if self.is_ddp:
             self.process_rank = dist.get_rank()
             self.world_size = dist.get_world_size()
-            
+        
         self.max_length = max_length
-        self.min_pixels = min_pixels
-        self.max_pixels = max_pixels
-        self.total_pixels = total_pixels
-        self.fps = fps
-        self.max_frames = max_frames
-        self.default_instruction = default_instruction
-
-    def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None):
+    
+    def forward(
+        self, 
+        query: Optional[Dict[str, torch.Tensor]] = None, 
+        passage: Optional[Dict[str, torch.Tensor]] = None
+    ) -> EncoderOutput:
+        """
+        Forward pass for training and inference.
+        
+        Args:
+            query: Tokenized query inputs.
+            passage: Tokenized passage inputs.
+            
+        Returns:
+            EncoderOutput containing embeddings and optionally loss/scores.
+        """
         q_reps = self.encode_query(query) if query else None
         p_reps = self.encode_passage(passage) if passage else None
-
-        # for inference
+        
+        # Inference mode
         if q_reps is None or p_reps is None:
-            return EncoderOutput(
-                q_reps=q_reps,
-                p_reps=p_reps
-            )
-
-        # for training
+            return EncoderOutput(q_reps=q_reps, p_reps=p_reps)
+        
+        # Training mode
         if self.training:
             if self.is_ddp:
                 q_reps = self._dist_gather_tensor(q_reps)
                 p_reps = self._dist_gather_tensor(p_reps)
-
+            
             scores = self.compute_similarity(q_reps, p_reps)
             scores = scores.view(q_reps.size(0), -1)
-
+            
             target = torch.arange(scores.size(0), device=scores.device, dtype=torch.long)
             target = target * (p_reps.size(0) // q_reps.size(0))
-
+            
             loss = self.compute_loss(scores / self.temperature, target)
             if self.is_ddp:
-                loss = loss * self.world_size  # counter average weight reduction
-        # for eval
-        else:
-            scores = self.compute_similarity(q_reps, p_reps)
-            loss = None
+                loss = loss * self.world_size
+            
+            return EncoderOutput(
+                loss=loss,
+                scores=scores,
+                q_reps=q_reps,
+                p_reps=p_reps,
+            )
+        
+        # Evaluation mode
+        scores = self.compute_similarity(q_reps, p_reps)
         return EncoderOutput(
-            loss=loss,
+            loss=None,
             scores=scores,
             q_reps=q_reps,
             p_reps=p_reps,
         )
-
-    def encode_passage(self, psg):
-        raise NotImplementedError('EncoderModel is an abstract class')
-
-    def encode_query(self, qry):
-        raise NotImplementedError('EncoderModel is an abstract class')
-
-    def compute_similarity(self, q_reps, p_reps):
+    
+    def encode_query(self, qry: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Encode query inputs to embeddings."""
+        raise NotImplementedError("Subclasses must implement encode_query")
+    
+    def encode_passage(self, psg: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Encode passage inputs to embeddings."""
+        raise NotImplementedError("Subclasses must implement encode_passage")
+    
+    def compute_similarity(self, q_reps: torch.Tensor, p_reps: torch.Tensor) -> torch.Tensor:
+        """Compute similarity matrix between query and passage embeddings."""
         return torch.matmul(q_reps, p_reps.transpose(0, 1))
-
-    def compute_loss(self, scores, target):
+    
+    def compute_loss(self, scores: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Compute contrastive loss from similarity scores."""
         return self.cross_entropy(scores, target)
     
     def gradient_checkpointing_enable(self, **kwargs):
+        """Enable gradient checkpointing for memory efficiency."""
         self.encoder.model.gradient_checkpointing_enable()
-
-    def _dist_gather_tensor(self, t: Optional[torch.Tensor]):
+    
+    def _dist_gather_tensor(self, t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Gather tensors across distributed processes."""
         if t is None:
             return None
+        
         t = t.contiguous()
-
         all_tensors = [torch.empty_like(t) for _ in range(self.world_size)]
         dist.all_gather(all_tensors, t)
-
+        
         all_tensors[self.process_rank] = t
-        all_tensors = torch.cat(all_tensors, dim=0)
-
-        return all_tensors
-
+        return torch.cat(all_tensors, dim=0)
+    
     @classmethod
     def build(
-            cls,
-            model_args,
-            train_args,
-            **hf_kwargs,
-    ):  
-        base_model = cls.TRANSFORMER_CLS.from_pretrained(model_args.model_name_or_path, **hf_kwargs)
+        cls,
+        model_args: ModelArguments,
+        train_args: Any,
+        **hf_kwargs,
+    ) -> "EncoderModel":
+        """
+        Build encoder model from pretrained checkpoint.
+        
+        Args:
+            model_args: Model configuration arguments.
+            train_args: Training configuration arguments.
+            **hf_kwargs: Additional keyword arguments for HuggingFace model loading.
+            
+        Returns:
+            Initialized encoder model.
+        """
+        base_model = cls.TRANSFORMER_CLS.from_pretrained(
+            model_args.model_name_or_path, **hf_kwargs
+        )
+        
         if base_model.config.pad_token_id is None:
             base_model.config.pad_token_id = 0
+        
+        # LoRA configuration
         if model_args.lora or model_args.lora_name_or_path:
             if train_args.gradient_checkpointing:
                 base_model.enable_input_require_grads()
+            
             if model_args.lora_name_or_path:
-                lora_config = LoraConfig.from_pretrained(model_args.lora_name_or_path, **hf_kwargs)
-                lora_model = PeftModel.from_pretrained(base_model, model_args.lora_name_or_path, is_trainable=True)
+                lora_config = LoraConfig.from_pretrained(
+                    model_args.lora_name_or_path, **hf_kwargs
+                )
+                lora_model = PeftModel.from_pretrained(
+                    base_model, model_args.lora_name_or_path, is_trainable=True
+                )
             else:
                 lora_config = LoraConfig(
                     base_model_name_or_path=model_args.model_name_or_path,
@@ -188,522 +301,178 @@ class EncoderModel(nn.Module):
                     inference_mode=False
                 )
                 lora_model = get_peft_model(base_model, lora_config)
-            model = cls(
+            
+            return cls(
                 encoder=lora_model,
                 pooling=model_args.pooling,
                 normalize=model_args.normalize,
-                temperature=model_args.temperature
+                temperature=model_args.temperature,
             )
-        else:
-            model = cls(
-                encoder=base_model,
-                pooling=model_args.pooling,
-                normalize=model_args.normalize,
-                temperature=model_args.temperature
-            )
-        return model
-
+        
+        return cls(
+            encoder=base_model,
+            pooling=model_args.pooling,
+            normalize=model_args.normalize,
+            temperature=model_args.temperature,
+        )
+    
     @classmethod
-    def load(cls,
-             model_name_or_path: str,
-             pooling: str = 'cls',
-             normalize: bool = False,
-             lora_name_or_path: str = None,
-             **hf_kwargs):
-        base_model = cls.TRANSFORMER_CLS.from_pretrained(model_name_or_path, **hf_kwargs)
+    def load(
+        cls,
+        model_name_or_path: str,
+        pooling: str = 'cls',
+        normalize: bool = False,
+        lora_name_or_path: Optional[str] = None,
+        **hf_kwargs
+    ) -> "EncoderModel":
+        """
+        Load encoder model from checkpoint.
+        
+        Args:
+            model_name_or_path: Path to model checkpoint.
+            pooling: Pooling strategy.
+            normalize: Whether to normalize embeddings.
+            lora_name_or_path: Optional LoRA adapter path.
+            **hf_kwargs: Additional keyword arguments.
+            
+        Returns:
+            Loaded encoder model.
+        """
+        base_model = cls.TRANSFORMER_CLS.from_pretrained(
+            model_name_or_path, **hf_kwargs
+        )
+        
         if base_model.config.pad_token_id is None:
             base_model.config.pad_token_id = 0
+        
         if lora_name_or_path:
             lora_config = LoraConfig.from_pretrained(lora_name_or_path, **hf_kwargs)
-            lora_model = PeftModel.from_pretrained(base_model, lora_name_or_path, config=lora_config)
+            lora_model = PeftModel.from_pretrained(
+                base_model, lora_name_or_path, config=lora_config
+            )
             lora_model = lora_model.merge_and_unload()
-            model = cls(
+            return cls(
                 encoder=lora_model,
                 pooling=pooling,
-                normalize=normalize
+                normalize=normalize,
             )
-        else:
-            model = cls(
-                encoder=base_model,
-                pooling=pooling,
-                normalize=normalize
-            )
-        return model
-
+        
+        return cls(
+            encoder=base_model,
+            pooling=pooling,
+            normalize=normalize,
+        )
+    
     def save(self, output_dir: str):
+        """Save model checkpoint."""
         self.encoder.model.save_pretrained(output_dir)
 
 
-class DenseModel(EncoderModel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.filter_false_negatives = kwargs.get("filter_false_negatives", None)
-        self.default_instruction = "Represent the user's input.",
-        
-    # Truncate token sequence to a specified max length
-    def _truncate_tokens(self, token_ids: List[int], max_length: int) -> List[int]:
-        if len(token_ids) <= max_length:
-            return token_ids
+# =============================================================================
+# Dense Retrieval Model
+# =============================================================================
 
-        special_token_ids = set(self.processor.tokenizer.all_special_ids)
-        num_special = sum(1 for token_idx in token_ids if token_idx in special_token_ids)
-        num_non_special_to_keep = max_length - num_special
-
-        final_token_ids = []
-        non_special_kept_count = 0
-        # Ensure retention of special tokens while truncating the rest
-        for token_idx in token_ids:
-            if token_idx in special_token_ids:
-                final_token_ids.append(token_idx)
-            elif non_special_kept_count < num_non_special_to_keep:
-                final_token_ids.append(token_idx)
-                non_special_kept_count += 1
-        return final_token_ids
-
-    def format_model_input(
-        self, 
-        text: Optional[Union[List[str], str]] = None,
-        image: Optional[Union[List[Union[str, Image.Image]], str, Image.Image]] = None,
-        video: Optional[Union[List[Union[str, List[Union[str, Image.Image]]]], str, List[Union[str, Image.Image]]]] = None,
-        instruction: Optional[str] = None,
-        fps: Optional[float] = None,
-        max_frames: Optional[int] = None
-    ) -> List[Dict]:
-
-        # Ensure instruction ends with punctuation
-        if instruction:
-            instruction = instruction.strip()
-            if instruction and not unicodedata.category(instruction[-1]).startswith('P'):
-                instruction = instruction + '.'
-
-        # Initialize conversation with system prompts
-        content = []
-        conversation = [
-            {"role": "system", "content": [{"type": "text", "text": instruction or self.default_instruction}]},
-            {"role": "user", "content": content}
-        ]
-
-        # Normalize text input to list
-        if text is None:
-            texts = []
-        elif isinstance(text, str):
-            texts = [text]
-        else:
-            texts = text
-        
-        # Normalize image input to list
-        if image is None:
-            images = []
-        elif not isinstance(image, list):
-            images = [image]
-        else:
-            images = image
-        
-        # Normalize video input to list
-        if video is None:
-            videos = []
-        elif is_video_input(video):
-            videos = [video]
-        else:
-            # Assume it's a list of videos
-            videos = video
-
-        # Add text, image, or video content to conversation
-        if not texts and not images and not videos:
-            content.append({'type': 'text', 'text': "NULL"})
-            return conversation
-
-        # Process each video
-        for vid in videos:
-            video_content = None
-            video_kwargs = {'total_pixels': self.total_pixels}
-            
-            if isinstance(vid, list):
-                # Video as frame sequence
-                video_content = vid
-                if self.max_frames is not None:
-                    video_content = sample_frames(video_content, self.max_frames)
-                video_content = [
-                    ('file://' + ele if isinstance(ele, str) else ele) 
-                    for ele in video_content
-                ]
-            elif isinstance(vid, str):
-                # Video as file path
-                video_content = vid if vid.startswith(('http://', 'https://')) else 'file://' + vid
-                video_kwargs = {'fps': fps or self.fps, 'max_frames': max_frames or self.max_frames}
-            else:
-                raise TypeError(f"Unrecognized video type: {type(vid)}")
-
-            # Add video input to content
-            if video_content:
-                content.append({
-                    'type': 'video', 
-                    'video': video_content,
-                    **video_kwargs
-                })
-
-        # Process each image
-        for img in images:
-            image_content = None
-            
-            if isinstance(img, Image.Image):
-                image_content = img
-            elif isinstance(img, str):
-                image_content = img if img.startswith(('http://', 'https://')) else 'file://' + img
-            else:
-                raise TypeError(f"Unrecognized image type: {type(img)}")
-
-            # Add image input to content
-            if image_content:
-                content.append({
-                    'type': 'image', 
-                    'image': image_content,
-                    "min_pixels": self.min_pixels,
-                    "max_pixels": self.max_pixels
-                })
-
-        # Process each text
-        for txt in texts:
-            content.append({'type': 'text', 'text': txt})
-
-        return conversation
-
-    # Preprocess input conversations for model consumption
-    def _preprocess_inputs(self, conversations: List[List[Dict]]) -> Dict[str, torch.Tensor]:
-        text = self.processor.apply_chat_template(
-            conversations, add_generation_prompt=True, tokenize=False
-        )
-
-        try:
-            # images, video_inputs, video_kwargs = process_vision_info(
-            #     conversations, image_patch_size=16,
-            #     return_video_metadata=True, return_video_kwargs=True
-            # )
-            images, _ = process_vision_info(
-                conversations, image_patch_size=16,
-            )
-        except Exception as e:
-            logger.error(f"Error in processing vision info: {e}")
-            images = None
-            video_inputs = None
-            video_kwargs = {'do_sample_frames': False}
-            text = self.processor.apply_chat_template(
-                [{'role': 'user', 'content': [{'type': 'text', 'text': 'NULL'}]}], 
-                add_generation_prompt=True, tokenize=False
-            )
-
-        # if video_inputs is not None:
-        #     videos, video_metadata = zip(*video_inputs)
-        #     videos = list(videos)
-        #     video_metadata = list(video_metadata)
-        # else:
-        #     videos, video_metadata = None, None
-
-        inputs = self.processor(
-            text=text, images=images, 
-            # videos=videos, video_metadata=video_metadata, 
-            # truncation=True, 
-            max_length=self.max_length, padding=True, do_resize=False, 
-            # **video_kwargs
-            # padding="longest",
-            return_tensors='pt',
-        )
-        # offsets = inputs["image_grid_thw"][:, 1] * inputs["image_grid_thw"][:, 2]
-        # pixel_values = list(torch.split(inputs["pixel_values"], offsets.tolist()))
-        # inputs["pixel_values"] = torch.nn.utils.rnn.pad_sequence(pixel_values, batch_first=True)
-        return inputs
-
-    # Pool the last hidden state by attention mask for embeddings
-    @staticmethod
-    def _pooling_last(hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        flipped_tensor = attention_mask.flip(dims=[1])
-        last_one_positions = flipped_tensor.argmax(dim=1)
-        col = attention_mask.shape[1] - last_one_positions - 1
-        row = torch.arange(hidden_state.shape[0], device=hidden_state.device)
-        return hidden_state[row, col]
-
-    # Process inputs to generate normalized embeddings
-    def process(self, inputs: List[Dict[str, Any]], normalize: bool = True) -> tuple:
-        conversations = [self.format_model_input(
-            text=ele.get('text'),
-            image=ele.get('image'),
-            # video=ele.get('video'),
-            # instruction=ele.get('instruction'),
-            # fps=ele.get('fps'),
-            # max_frames=ele.get('max_frames')
-        ) for ele in inputs]
-
-        processed_inputs = self._preprocess_inputs(conversations)
-        processed_inputs = {k: v.to(self.encoder.device) for k, v in processed_inputs.items()}
-
-        # for k, v in processed_inputs.items():
-        #     if isinstance(v, torch.Tensor):
-        #         print(k, v.shape)
-        
-        outputs = self.encoder(
-            **processed_inputs,
-            use_cache=False, # added
-            output_hidden_states=True, # added
-        )
-        embeddings = self._pooling_last(outputs['last_hidden_state'], outputs['attention_mask'])
-
-        # Normalize the embeddings if specified
-        if normalize:
-            embeddings = F.normalize(embeddings, p=2, dim=-1)
-
-        return embeddings
-
-
-    def encode_query(self, qry, embedding_projection=True):
-        query_hidden_states = self.process(qry)
-        return query_hidden_states
-    
-    def encode_passage(self, psg, embedding_projection=True):
-        return self.encode_query(psg)
-        
-    def _pooling(self, last_hidden_state, attention_mask):
-        if self.pooling in ['cls', 'first']:
-            reps = last_hidden_state[:, 0]
-        elif self.pooling in ['mean', 'avg', 'average']:
-            masked_hiddens = last_hidden_state.masked_fill(~attention_mask[..., None].bool(), 0.0)
-            reps = masked_hiddens.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
-        elif self.pooling in ['last', 'eos']:
-            left_padding = (attention_mask[:, -1].sum() == attention_mask.shape[0])
-            if left_padding:
-                reps = last_hidden_state[:, -1]
-            else:
-                sequence_lengths = attention_mask.sum(dim=1) - 1
-                batch_size = last_hidden_state.shape[0]
-                reps = last_hidden_state[torch.arange(batch_size, device=last_hidden_state.device), sequence_lengths]
-        else:
-            raise ValueError(f'unknown pooling method: {self.pooling}')
-        if self.normalize:
-            reps = torch.nn.functional.normalize(reps, p=2, dim=-1)
-        return reps
-    
-    def _aggregate(
-        self,
-        scores_raw: torch.Tensor,
-        dim_max: int,
-        dim_sum: int,
-    ) -> torch.Tensor:
-        """
-        Aggregate token-level scores into document-level.
-
-        Args:
-            scores_raw (Tensor): Raw scores tensor.
-            dim_max (int): Dimension to perform max/logsumexp.
-            dim_sum (int): Dimension to sum over after max.
-        """
-        return scores_raw.amax(dim=dim_max).sum(dim=dim_sum)
-    
-    def _apply_normalization(self, scores: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize scores by query lengths and enforce bounds.
-
-        Args:
-            scores (Tensor): Unnormalized score matrix [B, C].
-            lengths (Tensor): Query lengths [B].
-
-        Returns:
-            Tensor: Normalized scores.
-
-        Raises:
-            ValueError: If normalized scores exceed tolerance.
-        """
-        if scores.ndim == 2:
-            normalized = scores / lengths.unsqueeze(1)
-        else:
-            normalized = scores / lengths
-        return normalized
-
-    def get_index_and_masks(self, num_neg, scores):
-        B = scores.size(0)
-        device = scores.device
-        
-        # The positive passages
-        target = torch.arange(
-            B,
-            device=device,
-            dtype=torch.long,
-        ) * num_neg
-
-        no_filter_mask = target.unsqueeze(1) + torch.arange(num_neg, device=device, dtype=torch.long)
-        
-        row_idx = torch.arange(
-            B, device=device
-        )
-
-        return target, row_idx, no_filter_mask
-
-    def mask_inbatch_negative_percentile(self, scores, target, row_idx, no_filter_mask=None, percentile=0.95):
-        # semantic_thresholds = scores_semantic[row_idx, target] * percentile  # shape: [B]
-        pos_scores = scores.gather(1, target.unsqueeze(1))
-        threshold = pos_scores * percentile
-
-        # mask = scores_semantic > semantic_thresholds.unsqueeze(1)  # Mask out those greater than the threshold
-        mask = scores > threshold
-        
-        if no_filter_mask is not None:
-            B = scores.size(0)
-            device = scores.device
-            
-            rows = torch.arange(B, device=device).unsqueeze(1).expand_as(no_filter_mask)
-            mask[rows, no_filter_mask] = False  # type: ignore # don't mask the positive and annotated negatives, only consider the other in-batch negatives
-
-        # Apply the mask
-        scores.masked_fill_(mask, float('-inf'))
-        return scores
-    
-    def forward(self, query: Dict[str, Tensor] = None, passage: Dict[str, Tensor] = None, embedding_projection=True): # type: ignore
-        q_reps = self.encode_query(query, embedding_projection) if query else None
-        p_reps = self.encode_passage(passage, embedding_projection) if passage else None
-
-        # for inference
-        if q_reps is None or p_reps is None:
-            return EncoderOutput(q_reps=q_reps, p_reps=p_reps)
-
-        # for training
-        if self.training:
-            if self.is_ddp:
-                q_reps = self._dist_gather_tensor(q_reps)
-                p_reps = self._dist_gather_tensor(p_reps)
-
-            bs = q_reps.size(0)
-            device = q_reps.device
-            num_neg = p_reps.size(0) // bs
-            scores = self.compute_similarity(q_reps, p_reps)
-            scores = scores.view(bs, -1)
-
-            # 3. Indexing & Masking
-            target, row_idx, no_filter_mask = self.get_index_and_masks(num_neg, scores)
-
-            # 4. Optional False Negative Filtering
-            if self.filter_false_negatives:
-                scores = self.mask_inbatch_negative_percentile(
-                    scores, target, row_idx, no_filter_mask, percentile=0.95
-                )
-                
-            # Normal in-batch negatives InfoNCE loss with optional annotated hard negatives
-            loss = self.compute_loss(scores / self.temperature, target)
-            # ndcgloss = neuralNDCG_transposed(
-            #     y_pred=scores.gather(1, no_filter_mask),
-            #     y_true=torch.arange(num_neg, device=device, dtype=torch.float32).expand(bs, -1), 
-            #     device=device
-            # )
-            losses = {
-                "loss": loss,# + ndcgloss,
-                "infonce_loss": loss.clone().detach(),
-                # "ndcg_loss": ndcgloss.clone().detach(),
-            }
-            
-            # if self.is_ddp:
-            #     loss = loss * self.world_size  # counter average weight reduction
-            return losses
-        # for eval
-        else:
-            scores = self.compute_similarity(q_reps, p_reps)
-            loss = None
-            return EncoderOutput(
-                loss=loss,
-                scores=scores,
-                q_reps=q_reps,
-                p_reps=p_reps,
-            )
-            
-    def _calc_pairwise_ce_loss(self, scores: Tensor, target: Tensor, row_idx: Tensor) -> dict:
-        """Calculates Pairwise CE loss, optionally mixed with InfoNCE."""
-        top2 = scores.topk(2, dim=1).values
-        pos_scores = scores[row_idx, target]
-        
-        # Determine neg scores: if top1 is positive, take top2; else take top1
-        neg_scores = torch.where(top2[:, 0] == pos_scores, top2[:, 1], top2[:, 0])
-        
-        loss_pairwise_ce = F.softplus((neg_scores - pos_scores) / self.temperature).mean()
-        
-        if self.pairwise_inbatch_neg_loss:
-            loss_infonce = self.compute_loss(scores / self.temperature, target)
-
-            weight = self.pairwise_inbatch_neg_loss_weight
-            loss = (1 - weight) * loss_pairwise_ce + weight * loss_infonce
-            
-            return {
-                "loss": loss,
-                "total_loss": loss.clone().detach(),
-                "loss_infonce_w_inbatch_neg": weight * loss_infonce.clone().detach(),
-                "loss_pairwise_ce": (1 - weight) * loss_pairwise_ce.clone().detach(),
-            }
-        else:
-            return {
-                "loss": loss_pairwise_ce,
-                "loss_pairwise_ce": loss_pairwise_ce.clone().detach(),
-            }
-
-# Define output structure for embeddings
 @dataclass
-class Qwen3VLForEmbeddingOutput(ModelOutput):
+class Qwen3VLForEmbeddingOutput:
+    """Output dataclass for Qwen3VL embedding model."""
     last_hidden_state: Optional[torch.FloatTensor] = None
     attention_mask: Optional[torch.Tensor] = None
 
-# Define model class to compute embeddings
+
 class Qwen3VLForEmbedding(Qwen3VLPreTrainedModel):
+    """
+    Qwen3-VL model adapted for embedding generation.
+    
+    This class wraps the Qwen3-VL model to produce embeddings suitable
+    for retrieval tasks.
+    """
+    
     _checkpoint_conversion_mapping = {}
     accepts_loss_kwargs = False
-    config: Qwen3VLConfig
-
-    def __init__(self, config):
+    config_class = Qwen3VLConfig
+    
+    def __init__(self, config: Qwen3VLConfig):
         super().__init__(config)
         self.model = Qwen3VLModel(config)
         self.post_init()
-
-    def get_input_embeddings(self):
+    
+    def get_input_embeddings(self) -> nn.Module:
+        """Get input embedding layer."""
         return self.model.get_input_embeddings()
-
-    def set_input_embeddings(self, value):
+    
+    def set_input_embeddings(self, value: nn.Module):
+        """Set input embedding layer."""
         self.model.set_input_embeddings(value)
-
-    def set_decoder(self, decoder):
+    
+    def set_decoder(self, decoder: nn.Module):
+        """Set decoder module."""
         self.model.set_decoder(decoder)
-
-    def get_decoder(self):
+    
+    def get_decoder(self) -> nn.Module:
+        """Get decoder module."""
         return self.model.get_decoder()
-
-    # Extract video features from model
-    def get_video_features(self, pixel_values_videos: torch.FloatTensor,
-                           video_grid_thw: Optional[torch.LongTensor] = None):
+    
+    def get_video_features(
+        self, 
+        pixel_values_videos: torch.FloatTensor,
+        video_grid_thw: Optional[torch.LongTensor] = None
+    ) -> torch.Tensor:
+        """Extract video features from the model."""
         return self.model.get_video_features(pixel_values_videos, video_grid_thw)
-
-    # Extract image features from model
-    def get_image_features(self, pixel_values: torch.FloatTensor,
-                           image_grid_thw: Optional[torch.LongTensor] = None):
+    
+    def get_image_features(
+        self, 
+        pixel_values: torch.FloatTensor,
+        image_grid_thw: Optional[torch.LongTensor] = None
+    ) -> torch.Tensor:
+        """Extract image features from the model."""
         return self.model.get_image_features(pixel_values, image_grid_thw)
-
-    # Make modules accessible through properties
+    
     @property
-    def language_model(self):
+    def language_model(self) -> nn.Module:
+        """Get language model component."""
         return self.model.language_model
-
+    
     @property
-    def visual(self):
+    def visual(self) -> nn.Module:
+        """Get visual encoder component."""
         return self.model.visual
-
-    # Forward pass through model with input parameters
-    # @check_model_inputs
-    def forward(self,
-                input_ids: torch.LongTensor = None,
-                attention_mask: Optional[torch.Tensor] = None,
-                position_ids: Optional[torch.LongTensor] = None,
-                past_key_values: Optional[Cache] = None,
-                inputs_embeds: Optional[torch.FloatTensor] = None,
-                pixel_values: Optional[torch.Tensor] = None,
-                pixel_values_videos: Optional[torch.FloatTensor] = None,
-                image_grid_thw: Optional[torch.LongTensor] = None,
-                video_grid_thw: Optional[torch.LongTensor] = None,
-                cache_position: Optional[torch.LongTensor] = None,
-                logits_to_keep: Union[int, torch.Tensor] = 0,
-                **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen3VLForEmbeddingOutput]:
-        # Pass inputs through the model
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> Qwen3VLForEmbeddingOutput:
+        """
+        Forward pass through the embedding model.
+        
+        Args:
+            input_ids: Input token IDs.
+            attention_mask: Attention mask.
+            position_ids: Position IDs.
+            past_key_values: Cached key-value states.
+            inputs_embeds: Input embeddings.
+            pixel_values: Image pixel values.
+            pixel_values_videos: Video pixel values.
+            image_grid_thw: Image grid dimensions.
+            video_grid_thw: Video grid dimensions.
+            cache_position: Cache position indices.
+            logits_to_keep: Number of logits to keep.
+            **kwargs: Additional keyword arguments.
+            
+        Returns:
+            Qwen3VLForEmbeddingOutput with last hidden states and attention mask.
+        """
         outputs = self.model(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -717,187 +486,135 @@ class Qwen3VLForEmbedding(Qwen3VLPreTrainedModel):
             cache_position=cache_position,
             **kwargs,
         )
-        # Return the model output
+        
         return Qwen3VLForEmbeddingOutput(
             last_hidden_state=outputs.last_hidden_state,
             attention_mask=attention_mask,
         )
 
-def sample_frames(frames: List[Union[str, Image.Image]], max_segments: int) -> List[Union[str, Image.Image]]:
-    duration = len(frames)
-    if duration <= max_segments:
-        return frames
 
-    frame_id_array = np.linspace(0, duration - 1, max_segments, dtype=int)
-    frame_id_list = frame_id_array.tolist()
-    sampled_frames = [ frames[frame_idx] for frame_idx in frame_id_list ]
-    return sampled_frames
-
-def is_image_path(path: str) -> bool:
-    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.svg'}
+class DenseModel(EncoderModel):
+    """
+    Dense retrieval model for Qwen3-VL.
     
-    if path.startswith(('http://', 'https://')):
-        # Parse URL to remove query parameters
-        parsed_url = urlparse(path)
-        clean_path = parsed_url.path
-    else:
-        clean_path = path
+    This class implements dense retrieval with multimodal support,
+    including text, image, and video encoding capabilities.
+    """
     
-    # Check file extension
-    _, ext = os.path.splitext(clean_path.lower())
-    return ext in image_extensions
-
-def is_video_input(video) -> bool:
-    if isinstance(video, str):
-        return True
-    
-    if isinstance(video, list) and len(video) > 0:
-        # Check first element to determine the type
-        first_elem = video[0]
-        
-        if isinstance(first_elem, Image.Image):
-            return True
-        
-        if isinstance(first_elem, str):
-            return is_image_path(first_elem)
-    
-    return False
-
-# Define embedder class for processing inputs and generating embeddings
-class Qwen3VLEmbedder():
     def __init__(
-        self, 
-        model_name_or_path: str, 
-        max_length: int = MAX_LENGTH,
+        self,
+        *args,
         min_pixels: int = MIN_PIXELS,
         max_pixels: int = MAX_PIXELS,
         total_pixels: int = MAX_TOTAL_PIXELS,
         fps: float = FPS,
         max_frames: int = MAX_FRAMES,
         default_instruction: str = "Represent the user's input.",
-        **kwargs
+        filter_false_negatives: bool = False,
+        **kwargs,
     ):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.max_length = max_length
+        super().__init__(*args, **kwargs)
+        
         self.min_pixels = min_pixels
         self.max_pixels = max_pixels
         self.total_pixels = total_pixels
         self.fps = fps
         self.max_frames = max_frames
-
         self.default_instruction = default_instruction
-
-        self.model = Qwen3VLForEmbedding.from_pretrained(
-            model_name_or_path, trust_remote_code=True, **kwargs
-        ).to(device)
-        self.processor = Qwen3VLProcessor.from_pretrained(
-            model_name_or_path, padding_side='right'
-        )
-        
-         # Mimic colqwen3
-        patch_size = getattr(self.processor.image_processor, "patch_size", None)
-        merge_size = getattr(self.processor.image_processor, "merge_size", None)
-        if patch_size is None or merge_size is None:
-                raise ValueError("Qwen3VL image processor is missing `patch_size` or `merge_size`.")
-        
-        tile = patch_size * merge_size
-        self.processor.image_processor.max_pixels = 768 * tile * tile
-        self.processor.image_processor.size["longest_edge"] = self.processor.image_processor.max_pixels
-        # self.model.eval()
-
-    # @torch.no_grad()
-    def forward(self, inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-        outputs = self.encoder(
-            **inputs,
-            use_cache=False, # added
-            output_hidden_states=True, # added
-        )
-        return {
-            'last_hidden_state': outputs.last_hidden_state,
-            'attention_mask': inputs.get('attention_mask')
-        }
-
-    # Truncate token sequence to a specified max length
+        self.filter_false_negatives = filter_false_negatives
+    
     def _truncate_tokens(self, token_ids: List[int], max_length: int) -> List[int]:
+        """
+        Truncate token sequence while preserving special tokens.
+        
+        Args:
+            token_ids: List of token IDs.
+            max_length: Maximum sequence length.
+            
+        Returns:
+            Truncated token ID list.
+        """
         if len(token_ids) <= max_length:
             return token_ids
-
+        
         special_token_ids = set(self.processor.tokenizer.all_special_ids)
-        num_special = sum(1 for token_idx in token_ids if token_idx in special_token_ids)
+        num_special = sum(1 for tid in token_ids if tid in special_token_ids)
         num_non_special_to_keep = max_length - num_special
-
+        
         final_token_ids = []
         non_special_kept_count = 0
-        # Ensure retention of special tokens while truncating the rest
-        for token_idx in token_ids:
-            if token_idx in special_token_ids:
-                final_token_ids.append(token_idx)
+        
+        for tid in token_ids:
+            if tid in special_token_ids:
+                final_token_ids.append(tid)
             elif non_special_kept_count < num_non_special_to_keep:
-                final_token_ids.append(token_idx)
+                final_token_ids.append(tid)
                 non_special_kept_count += 1
+        
         return final_token_ids
-
+    
     def format_model_input(
-        self, 
+        self,
         text: Optional[Union[List[str], str]] = None,
         image: Optional[Union[List[Union[str, Image.Image]], str, Image.Image]] = None,
-        video: Optional[Union[List[Union[str, List[Union[str, Image.Image]]]], str, List[Union[str, Image.Image]]]] = None,
+        video: Optional[Union[
+            List[Union[str, List[Union[str, Image.Image]]]], 
+            str, 
+            List[Union[str, Image.Image]]
+        ]] = None,
         instruction: Optional[str] = None,
         fps: Optional[float] = None,
-        max_frames: Optional[int] = None
-    ) -> List[Dict]:
-
-        # Ensure instruction ends with punctuation
+        max_frames: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Format input data into conversation format for the model.
+        
+        Args:
+            text: Text content(s).
+            image: Image content(s) as paths or PIL Images.
+            video: Video content(s) as paths or frame sequences.
+            instruction: Instruction prompt.
+            fps: Frames per second for video.
+            max_frames: Maximum frames to sample.
+            
+        Returns:
+            Formatted conversation list.
+        """
+        # Normalize instruction
         if instruction:
             instruction = instruction.strip()
             if instruction and not unicodedata.category(instruction[-1]).startswith('P'):
                 instruction = instruction + '.'
-
-        # Initialize conversation with system prompts
+        
+        # Initialize conversation structure
         content = []
         conversation = [
             {"role": "system", "content": [{"type": "text", "text": instruction or self.default_instruction}]},
             {"role": "user", "content": content}
         ]
-
-        # Normalize text input to list
-        if text is None:
-            texts = []
-        elif isinstance(text, str):
-            texts = [text]
-        else:
-            texts = text
         
-        # Normalize image input to list
-        if image is None:
-            images = []
-        elif not isinstance(image, list):
-            images = [image]
-        else:
-            images = image
+        # Normalize inputs to lists
+        texts = [] if text is None else ([text] if isinstance(text, str) else text)
+        images = [] if image is None else ([image] if not isinstance(image, list) else image)
         
-        # Normalize video input to list
         if video is None:
             videos = []
         elif is_video_input(video):
             videos = [video]
         else:
-            # Assume it's a list of videos
             videos = video
-
-        # Add text, image, or video content to conversation
+        
+        # Handle empty input
         if not texts and not images and not videos:
             content.append({'type': 'text', 'text': "NULL"})
             return conversation
-
-        # Process each video
+        
+        # Process videos
         for vid in videos:
             video_content = None
             video_kwargs = {'total_pixels': self.total_pixels}
             
             if isinstance(vid, list):
-                # Video as frame sequence
                 video_content = vid
                 if self.max_frames is not None:
                     video_content = sample_frames(video_content, self.max_frames)
@@ -906,21 +623,19 @@ class Qwen3VLEmbedder():
                     for ele in video_content
                 ]
             elif isinstance(vid, str):
-                # Video as file path
                 video_content = vid if vid.startswith(('http://', 'https://')) else 'file://' + vid
                 video_kwargs = {'fps': fps or self.fps, 'max_frames': max_frames or self.max_frames}
             else:
                 raise TypeError(f"Unrecognized video type: {type(vid)}")
-
-            # Add video input to content
+            
             if video_content:
                 content.append({
                     'type': 'video', 
                     'video': video_content,
                     **video_kwargs
                 })
-
-        # Process each image
+        
+        # Process images
         for img in images:
             image_content = None
             
@@ -930,8 +645,7 @@ class Qwen3VLEmbedder():
                 image_content = img if img.startswith(('http://', 'https://')) else 'file://' + img
             else:
                 raise TypeError(f"Unrecognized image type: {type(img)}")
-
-            # Add image input to content
+            
             if image_content:
                 content.append({
                     'type': 'image', 
@@ -939,90 +653,263 @@ class Qwen3VLEmbedder():
                     "min_pixels": self.min_pixels,
                     "max_pixels": self.max_pixels
                 })
-
-        # Process each text
+        
+        # Process text
         for txt in texts:
             content.append({'type': 'text', 'text': txt})
-
+        
         return conversation
-
-    # Preprocess input conversations for model consumption
-    def _preprocess_inputs(self, conversations: List[List[Dict]]) -> Dict[str, torch.Tensor]:
+    
+    def _preprocess_inputs(
+        self, 
+        conversations: List[List[Dict[str, Any]]]
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Preprocess conversations for model consumption.
+        
+        Args:
+            conversations: List of formatted conversations.
+            
+        Returns:
+            Dictionary of preprocessed tensors.
+        """
         text = self.processor.apply_chat_template(
             conversations, add_generation_prompt=True, tokenize=False
         )
-
+        
         try:
-            # images, video_inputs, video_kwargs = process_vision_info(
-            #     conversations, image_patch_size=16,
-            #     return_video_metadata=True, return_video_kwargs=True
-            # )
             images, _ = process_vision_info(
                 conversations, image_patch_size=16,
             )
         except Exception as e:
             logger.error(f"Error in processing vision info: {e}")
             images = None
-            video_inputs = None
-            video_kwargs = {'do_sample_frames': False}
             text = self.processor.apply_chat_template(
                 [{'role': 'user', 'content': [{'type': 'text', 'text': 'NULL'}]}], 
                 add_generation_prompt=True, tokenize=False
             )
-
-        # if video_inputs is not None:
-        #     videos, video_metadata = zip(*video_inputs)
-        #     videos = list(videos)
-        #     video_metadata = list(video_metadata)
-        # else:
-        #     videos, video_metadata = None, None
-
+        
         inputs = self.processor(
-            text=text, images=images, 
-            # videos=videos, video_metadata=video_metadata, 
-            # truncation=True, 
-            max_length=self.max_length, padding=True, do_resize=False, 
-            # **video_kwargs
-            # padding="longest",
+            text=text, 
+            images=images, 
+            max_length=self.max_length, 
+            padding=True, 
+            do_resize=False, 
             return_tensors='pt',
         )
-        # offsets = inputs["image_grid_thw"][:, 1] * inputs["image_grid_thw"][:, 2]
-        # pixel_values = list(torch.split(inputs["pixel_values"], offsets.tolist()))
-        # inputs["pixel_values"] = torch.nn.utils.rnn.pad_sequence(pixel_values, batch_first=True)
+        
         return inputs
-
-    # Pool the last hidden state by attention mask for embeddings
+    
     @staticmethod
     def _pooling_last(hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        flipped_tensor = attention_mask.flip(dims=[1])
-        last_one_positions = flipped_tensor.argmax(dim=1)
+        """
+        Pool embeddings using the last valid token position.
+        
+        Args:
+            hidden_state: Hidden states from the model.
+            attention_mask: Attention mask indicating valid positions.
+            
+        Returns:
+            Pooled embeddings.
+        """
+        flipped_mask = attention_mask.flip(dims=[1])
+        last_one_positions = flipped_mask.argmax(dim=1)
         col = attention_mask.shape[1] - last_one_positions - 1
         row = torch.arange(hidden_state.shape[0], device=hidden_state.device)
         return hidden_state[row, col]
-
-    # Process inputs to generate normalized embeddings
-    def process(self, inputs: List[Dict[str, Any]], normalize: bool = True) -> tuple:
-        conversations = [self.format_model_input(
-            text=ele.get('text'),
-            image=ele.get('image'),
-            # video=ele.get('video'),
-            # instruction=ele.get('instruction'),
-            # fps=ele.get('fps'),
-            # max_frames=ele.get('max_frames')
-        ) for ele in inputs]
-
-        processed_inputs = self._preprocess_inputs(conversations)
-        processed_inputs = {k: v.to(self.model.device) for k, v in processed_inputs.items()}
-
-        for k, v in processed_inputs.items():
-            if isinstance(v, torch.Tensor):
-                print(k, v.shape)
+    
+    def process(
+        self, 
+        inputs: List[Dict[str, Any]], 
+        normalize: bool = True
+    ) -> torch.Tensor:
+        """
+        Process inputs to generate normalized embeddings.
         
-        outputs = self.forward(processed_inputs)
-        embeddings = self._pooling_last(outputs['last_hidden_state'], outputs['attention_mask'])
-
-        # Normalize the embeddings if specified
+        Args:
+            inputs: List of input dictionaries.
+            normalize: Whether to L2-normalize embeddings.
+            
+        Returns:
+            Normalized embedding tensor.
+        """
+        conversations = [
+            self.format_model_input(
+                text=ele.get('text'),
+                image=ele.get('image'),
+            ) for ele in inputs
+        ]
+        
+        processed_inputs = self._preprocess_inputs(conversations)
+        processed_inputs = {k: v.to(self.encoder.device) for k, v in processed_inputs.items()}
+        
+        outputs = self.encoder(
+            **processed_inputs,
+            use_cache=False,
+            output_hidden_states=True,
+        )
+        
+        embeddings = self._pooling_last(outputs.last_hidden_state, outputs.attention_mask)
+        
         if normalize:
             embeddings = F.normalize(embeddings, p=2, dim=-1)
-
+        
         return embeddings
+    
+    def encode_query(
+        self, 
+        qry: Union[Dict[str, torch.Tensor], List[Dict[str, Any]]],
+        embedding_projection: bool = True
+    ) -> torch.Tensor:
+        """
+        Encode query inputs to embeddings.
+        
+        Args:
+            qry: Query inputs (tokenized or raw).
+            embedding_projection: Whether to apply embedding projection.
+            
+        Returns:
+            Query embeddings.
+        """
+        if isinstance(qry, dict):
+            # Already tokenized
+            query_hidden_states = self.process([qry])
+        else:
+            query_hidden_states = self.process(qry)
+        return query_hidden_states
+    
+    def encode_passage(
+        self, 
+        psg: Union[Dict[str, torch.Tensor], List[Dict[str, Any]]],
+        embedding_projection: bool = True
+    ) -> torch.Tensor:
+        """
+        Encode passage inputs to embeddings.
+        
+        Args:
+            psg: Passage inputs (tokenized or raw).
+            embedding_projection: Whether to apply embedding projection.
+            
+        Returns:
+            Passage embeddings.
+        """
+        return self.encode_query(psg, embedding_projection)
+    
+    def forward(
+        self, 
+        query: Optional[Union[Dict[str, torch.Tensor], List[Dict[str, Any]]]] = None, 
+        passage: Optional[Union[Dict[str, torch.Tensor], List[Dict[str, Any]]]] = None,
+        embedding_projection: bool = True
+    ) -> Union[EncoderOutput, Dict[str, torch.Tensor]]:
+        """
+        Forward pass for training and inference.
+        
+        Args:
+            query: Query inputs.
+            passage: Passage inputs.
+            embedding_projection: Whether to apply embedding projection.
+            
+        Returns:
+            EncoderOutput for inference, Dict of losses for training.
+        """
+        q_reps = self.encode_query(query, embedding_projection) if query else None
+        p_reps = self.encode_passage(passage, embedding_projection) if passage else None
+        
+        # Inference mode
+        if q_reps is None or p_reps is None:
+            return EncoderOutput(q_reps=q_reps, p_reps=p_reps)
+        
+        # Training mode
+        if self.training:
+            if self.is_ddp:
+                q_reps = self._dist_gather_tensor(q_reps)
+                p_reps = self._dist_gather_tensor(p_reps)
+            
+            bs = q_reps.size(0)
+            num_neg = p_reps.size(0) // bs
+            scores = self.compute_similarity(q_reps, p_reps)
+            scores = scores.view(bs, -1)
+            
+            # Get indices and masks
+            target, row_idx, no_filter_mask = self._get_index_and_masks(num_neg, scores)
+            
+            # Optional false negative filtering
+            if self.filter_false_negatives:
+                scores = self._mask_inbatch_negative_percentile(
+                    scores, target, row_idx, no_filter_mask, percentile=0.95
+                )
+            
+            loss = self.compute_loss(scores / self.temperature, target)
+            
+            return {
+                "loss": loss,
+                "infonce_loss": loss.clone().detach(),
+            }
+        
+        # Evaluation mode
+        scores = self.compute_similarity(q_reps, p_reps)
+        return EncoderOutput(
+            loss=None,
+            scores=scores,
+            q_reps=q_reps,
+            p_reps=p_reps,
+        )
+    
+    def _get_index_and_masks(
+        self, 
+        num_neg: int, 
+        scores: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get target indices and masks for loss computation.
+        
+        Args:
+            num_neg: Number of negatives per query.
+            scores: Similarity scores.
+            
+        Returns:
+            Tuple of (target, row_idx, no_filter_mask).
+        """
+        B = scores.size(0)
+        device = scores.device
+        
+        target = torch.arange(B, device=device, dtype=torch.long) * num_neg
+        no_filter_mask = target.unsqueeze(1) + torch.arange(num_neg, device=device, dtype=torch.long)
+        row_idx = torch.arange(B, device=device)
+        
+        return target, row_idx, no_filter_mask
+    
+    def _mask_inbatch_negative_percentile(
+        self,
+        scores: torch.Tensor,
+        target: torch.Tensor,
+        row_idx: torch.Tensor,
+        no_filter_mask: Optional[torch.Tensor] = None,
+        percentile: float = 0.95
+    ) -> torch.Tensor:
+        """
+        Mask in-batch negatives based on percentile threshold.
+        
+        Args:
+            scores: Similarity scores.
+            target: Positive passage indices.
+            row_idx: Row indices.
+            no_filter_mask: Mask for passages that shouldn't be filtered.
+            percentile: Percentile threshold for masking.
+            
+        Returns:
+            Scores with masked negatives.
+        """
+        pos_scores = scores.gather(1, target.unsqueeze(1))
+        threshold = pos_scores * percentile
+        
+        mask = scores > threshold
+        
+        if no_filter_mask is not None:
+            B = scores.size(0)
+            device = scores.device
+            rows = torch.arange(B, device=device).unsqueeze(1).expand_as(no_filter_mask)
+            mask[rows, no_filter_mask] = False
+        
+        scores.masked_fill_(mask, float('-inf'))
+        return scores
