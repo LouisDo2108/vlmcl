@@ -1,6 +1,7 @@
 import os
-from typing import Tuple
+from typing import List, Tuple
 
+import datasets
 from datasets import concatenate_datasets, load_dataset
 from PIL import Image
 from tevatron.hyperbolic.arguments import DataArguments
@@ -12,6 +13,28 @@ def _first_scalar(value):
     if isinstance(value, list):
         return value[0] if value else ""
     return value
+
+
+def get_unique_pairs(eval_data, text_field: str, img_path_field: str):
+    """Unique (text, img_path) pairs from MMEB eval rows for qry or tgt encoding."""
+    unique_pair = set()
+    for row in eval_data:
+        text_val = row[text_field]
+        img_val = row[img_path_field]
+        if isinstance(text_val, str):
+            if text_val:
+                unique_pair.add((text_val, img_val))
+            else:
+                if isinstance(img_val, list):
+                    for img_path in img_val:
+                        unique_pair.add((text_val, img_path))
+                else:
+                    unique_pair.add((text_val, img_val))
+        elif isinstance(text_val, list):
+            assert isinstance(img_val, list) and len(img_val) == len(text_val)
+            for text, img_path in zip(text_val, img_val):
+                unique_pair.add((text, img_path))
+    return [{"text": t, "img_path": p} for t, p in unique_pair]
 
 
 class CLIPTrainDataset(Dataset):
@@ -63,3 +86,47 @@ class CLIPTrainDataset(Dataset):
             pos_text = "  "
 
         return (qry_text, qry_image), (pos_text, pos_image)
+
+
+class EvalDataset(Dataset):
+    """
+    MMEB eval: unique (text, image_path) pairs for query or target encoding.
+
+    Mirrors VLM2Vec EvalDataset; each item is (text, PIL image) for CLIPEvalCollator.
+    """
+
+    def __init__(
+        self,
+        data_args: DataArguments,
+        subset: str,
+        text_field: str,
+        img_path_field: str,
+        eval_data=None,
+    ):
+        self.data_args = data_args
+        self.eval_data = eval_data or load_dataset(
+            "TIGER-Lab/MMEB-eval",
+            subset,
+            split="test",
+        )
+        self.paired_data = get_unique_pairs(self.eval_data, text_field, img_path_field)
+        self.paired_dataset = datasets.Dataset.from_dict({
+            "text": [p["text"] for p in self.paired_data],
+            "img_path": [p["img_path"] for p in self.paired_data],
+        })
+        print_rank(f"{subset} {text_field}: {len(self.paired_data)} unique pairs")
+
+    def __len__(self):
+        return len(self.paired_dataset)
+
+    def __getitem__(self, item: int) -> Tuple[str, Image.Image | None]:
+        text = self.paired_dataset[item]["text"]
+        img_path = self.paired_dataset[item]["img_path"]
+        return text, self._load_image(img_path)
+
+    def _load_image(self, img_path: str) -> Image.Image | None:
+        if not img_path:
+            return None
+        path = os.path.join(self.data_args.image_dir, img_path)
+        image = Image.open(path)
+        return image.convert("RGB") if image.mode != "RGB" else image

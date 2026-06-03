@@ -46,7 +46,7 @@ ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
   --lora \
   --subset_name CIRR \
   --num_sample_per_subset 100000 \
-  --image_dir /home/thuy0050/ft49_scratch2/thuy0050/data/vlm2vec_train/MMEB-train \
+  --image_dir /home/thuy0050/ft49_scratch2/thuy0050/data/MMEB/MMEB-train \
   --max_len 77 \
   --output_dir "$OUTPUT_DIR" \
   --run_name "$EXP_NAME" \

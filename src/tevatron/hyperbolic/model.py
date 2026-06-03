@@ -65,15 +65,29 @@ class CLIPContrastiveModel(nn.Module):
         return reps
 
     @classmethod
+    def load_clip_encoder(cls, model_name_or_path: str, **hf_kwargs) -> CLIPModel:
+        load_kwargs = dict(hf_kwargs)
+        print_master(f"Loading CLIP from {model_name_or_path} with {load_kwargs}")
+        try:
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+            model = CLIPModel.from_pretrained(model_name_or_path, **load_kwargs)
+            print_master("Using flash attention 2")
+            return model
+        except Exception as e:
+            try:
+                load_kwargs["attn_implementation"] = "sdpa"
+                print_master("Using sdpa")
+                return CLIPModel.from_pretrained(model_name_or_path, **load_kwargs)
+            except Exception as e2:
+                load_kwargs["attn_implementation"] = "eager"
+                print_master("Using eager")
+                return CLIPModel.from_pretrained(model_name_or_path, **load_kwargs)
+
+    @classmethod
     def build(cls, model_args: ModelArguments, training_args: TrainingArguments = None, **kwargs):
-        del training_args
-        print_master(f"Loading CLIP from {model_args.model_name_or_path}")
         dtype = kwargs.pop("torch_dtype", torch.bfloat16)
-        base_model = CLIPModel.from_pretrained(
-            model_args.model_name_or_path,
-            torch_dtype=dtype,
-            **kwargs,
-        )
+        hf_kwargs = {"torch_dtype": dtype, **kwargs}
+        base_model = cls.load_clip_encoder(model_args.model_name_or_path, **hf_kwargs)
 
         if model_args.lora:
             lora_config = LoraConfig(
@@ -90,6 +104,60 @@ class CLIPContrastiveModel(nn.Module):
 
         return cls(
             encoder=base_model,
+            normalize=model_args.normalize,
+            temperature=model_args.temperature,
+        )
+    
+    @classmethod
+    def load(cls, model_args: ModelArguments, **kwargs):
+        """
+        Load a checkpoint produced by training.
+
+        Symmetry with build():
+        - build(lora=True): base from model_name_or_path + new LoRA adapters
+        - load (PEFT checkpoint): base from adapter_config.base_model_name_or_path + adapter weights from checkpoint dir
+
+        After training, point both model_name_or_path and lora_name_or_path at
+        output_dir (trainer saves encoder/adapter there).
+        """
+        dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        hf_kwargs = {"torch_dtype": dtype, **kwargs}
+
+        # Adapter checkpoint: same dir as trainer.save_model (adapter_config + weights)
+        adapter_path = model_args.lora_name_or_path or model_args.model_name_or_path
+
+        lora_config = None
+        if model_args.lora or model_args.lora_name_or_path:
+            try:
+                lora_config = LoraConfig.from_pretrained(adapter_path)
+            except Exception as e:
+                print_master(str(e))
+                print_master(
+                    "Could not load LoRA config from adapter_path; "
+                    "falling back to full CLIP weights."
+                )
+
+        if lora_config is not None:
+            base_model = cls.load_clip_encoder(
+                lora_config.base_model_name_or_path,
+                **hf_kwargs,
+            )
+            print_master(f"Loading LoRA checkpoint from {adapter_path}")
+            lora_model = PeftModel.from_pretrained(
+                base_model,
+                adapter_path,
+                config=lora_config,
+            )
+            encoder = lora_model.merge_and_unload()
+        else:
+            print_master(f"This is not a PEFT model!!! ")
+            encoder = cls.load_clip_encoder(
+                model_args.model_name_or_path,
+                **hf_kwargs,
+            )
+
+        return cls(
+            encoder=encoder,
             normalize=model_args.normalize,
             temperature=model_args.temperature,
         )

@@ -105,3 +105,18 @@ class CLIPCollator:
             "attention_mask": input_ids.ne(self.processor.tokenizer.pad_token_id),
             "pixel_values": torch.stack(pixel_values, dim=0),
         }
+
+
+@dataclass
+class CLIPEvalCollator:
+    """
+    Eval collator for MMEB (mirrors VLM2Vec EvalCollator).
+
+    Each example is (text, image). Returns one batch dict for model(qry=...) or model(tgt=...).
+    """
+
+    data_args: DataArguments
+    processor: CLIPProcessor
+
+    def __call__(self, examples):
+        return CLIPCollator(self.data_args, self.processor)._batch(examples)
