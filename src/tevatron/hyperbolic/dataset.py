@@ -8,11 +8,82 @@ from tevatron.hyperbolic.arguments import DataArguments
 from tevatron.hyperbolic.utils import print_rank
 from torch.utils.data import Dataset
 
+MMEB_IMAGE_TOKEN = "<|image_1|>"
+
+MMEB_retrieval_instruction_dict = {
+    "CIRR": {
+        "query": "Given an image, find a similar everyday image with the described changes:",
+        "target": "Represent the given image.\n",
+    },
+    "FashionIQ": {
+        "query": "Find an image to match the fashion image and style note.\n",
+        "target": "Represent the given image.\n",
+    },
+    "NIGHTS": {
+        "query": "Find a day-to-day image that looks similar to the provided image.\n",
+        "target": "Represent the given image.\n",
+    },
+    "OVEN": {
+        "query": "Retrieve a Wikipedia imagedescription pair that provides evidence for the question of this image.\n",
+        "target": "Represent the given Wikipedia image with related text information.\n",
+    },
+    "VisDial": {
+        "query": "Represent the given dialogue about an image, which is used for image retrieval.\n",
+        "target": "Represent the given image.\n",
+    },
+    "VisualNews_i2t": {
+        "query": "Retrieve an image of this news caption.\n",
+        "target": "Represent the given image.\n",
+    },
+    "VisualNews_t2i": {
+        "query": "Find a caption for the news in the given photo.\n",
+        "target": "",
+    },
+    "MSCOCO_i2t": {
+        "query": "Find an image caption describing  the given everyday image.\n",
+        "target": "",
+    },
+    "MSCOCO_t2i": {
+        "query": "Find me an everyday image that matches the given caption.\n",
+        "target": "Represent the given image.",
+    },
+    "WebQA": {
+        "query": "Find a Wikipedia image-passage pair that answers this question.\n",
+        "target": "Represent the given Wikipedia image with related text information.",
+    },
+    "EDIS": {
+        "query": "Find a news image that matches the provided caption.\n",
+        "target": "Represent the given image with related text information.",
+    },
+    "Wiki-SS-NQ": {
+        "query": "Find the document screenshot that  can answer the given query.\n",
+        "target": "Represent the given document screenshot.\n",
+    },
+}
+
 
 def _first_scalar(value):
     if isinstance(value, list):
         return value[0] if value else ""
     return value
+    
+def _clean_mmeb_text(text: str, instruction: str) -> str:
+    """Strip MMEB image token, task instruction, and surrounding whitespace."""
+    if not text:
+        return ""
+    text = text.replace(MMEB_IMAGE_TOKEN, "", 1)
+    text = text.replace(instruction, "", 1)
+    return text.strip()
+
+
+def remove_mmeb_instructions(batch, query_instruction, target_instruction):
+    batch["qry"] = [_clean_mmeb_text(t, query_instruction) for t in batch["qry"]]
+    batch["pos_text"] = [_clean_mmeb_text(t, target_instruction) for t in batch["pos_text"]]
+    return batch
+
+def remove_mmeb_instructions_eval(batch, instruction):
+    batch["text"] = [_clean_mmeb_text(t, instruction) for t in batch["text"]]
+    return batch
 
 
 def get_unique_pairs(eval_data, text_field: str, img_path_field: str):
@@ -37,27 +108,53 @@ def get_unique_pairs(eval_data, text_field: str, img_path_field: str):
     return [{"text": t, "img_path": p} for t, p in unique_pair]
 
 
+def _load_mmeb_train_subset(data_args: DataArguments, subset: str):
+    if subset not in MMEB_retrieval_instruction_dict:
+        raise ValueError(
+            f"Unknown subset {subset!r}; add it to MMEB_retrieval_instruction_dict"
+        )
+    ds = load_dataset(
+        "parquet",
+        data_dir=os.path.join(data_args.image_dir, subset),
+        data_files={"original": "original-00000-of-00001.parquet"},
+    )["original"]
+    if (
+        data_args.num_sample_per_subset is not None
+        and data_args.num_sample_per_subset < ds.num_rows
+    ):
+        ds = ds.select(range(int(data_args.num_sample_per_subset)))
+    if not data_args.add_instructions:
+        instr = MMEB_retrieval_instruction_dict[subset]
+        ds = ds.map(
+            lambda x: remove_mmeb_instructions(
+                x, instr["query"], instr["target"]
+            ),
+            batched=True,
+            batch_size=2048,
+            drop_last_batch=False,
+            desc=f"strip MMEB instructions ({subset})",
+        )
+    return ds
+
+
 class CLIPTrainDataset(Dataset):
     """MMEB parquet rows as CLIP (text, image) pairs for query and positive."""
 
     def __init__(self, data_args: DataArguments):
         self.data_args = data_args
+        self._image_root = data_args.image_dir
         subsets = []
         print_rank(f"Loading {len(data_args.subset_name)} subsets: {data_args.subset_name}")
         for subset in data_args.subset_name:
-            ds = load_dataset(
-                "parquet",
-                data_dir=os.path.join(data_args.image_dir, subset),
-                data_files={"original": "original-00000-of-00001.parquet"},
-            )["original"]
-            if (
-                data_args.num_sample_per_subset is not None
-                and data_args.num_sample_per_subset < ds.num_rows
-            ):
-                ds = ds.select(range(int(data_args.num_sample_per_subset)))
+            ds = _load_mmeb_train_subset(data_args, subset)
             subsets.append(ds)
             print_rank(f"{subset}: {len(ds)} rows")
         self.train_data = concatenate_datasets(subsets)
+        # Columnar refs avoid per-row dict materialization in __getitem__.
+        self._qry = self.train_data["qry"]
+        self._pos_text = self.train_data["pos_text"]
+        self._qry_image_path = self.train_data["qry_image_path"]
+        self._pos_image_path = self.train_data["pos_image_path"]
 
     def __len__(self):
         return len(self.train_data)
@@ -66,25 +163,29 @@ class CLIPTrainDataset(Dataset):
         img_path = _first_scalar(img_path)
         if not img_path:
             return None
-        path = os.path.join(self.data_args.image_dir, img_path)
-        image = Image.open(path)
-        return image.convert("RGB") if image.mode != "RGB" else image
+        path = os.path.join(self._image_root, img_path)
+        with Image.open(path) as image:
+            return image.convert("RGB")
+
+    @staticmethod
+    def _pair_text_image(text, image: Image.Image | None):
+        text = _first_scalar(text)
+        if text is None:
+            text = ""
+        text = str(text)
+        if text.strip() or image is not None:
+            return text, image
+        return "", image
 
     def __getitem__(
         self, idx: int
     ) -> Tuple[Tuple[str, Image.Image | None], Tuple[str, Image.Image | None]]:
-        row = self.train_data[idx]
-
-        qry_text = _first_scalar(row["qry"])
-        pos_text = _first_scalar(row["pos_text"])
-        qry_image = self._load_image(row["qry_image_path"])
-        pos_image = self._load_image(row["pos_image_path"])
-
-        if not qry_text and qry_image is None:
-            qry_text = "  "
-        if not pos_text and pos_image is None:
-            pos_text = "  "
-
+        qry_text, qry_image = self._pair_text_image(
+            self._qry[idx], self._load_image(self._qry_image_path[idx])
+        )
+        pos_text, pos_image = self._pair_text_image(
+            self._pos_text[idx], self._load_image(self._pos_image_path[idx])
+        )
         return (qry_text, qry_image), (pos_text, pos_image)
 
 
@@ -114,6 +215,15 @@ class EvalDataset(Dataset):
             "text": [p["text"] for p in self.paired_data],
             "img_path": [p["img_path"] for p in self.paired_data],
         })
+        if text_field == "qry_text":
+            instruction = MMEB_retrieval_instruction_dict[subset]["query"]
+        elif text_field == "tgt_text":
+            instruction = MMEB_retrieval_instruction_dict[subset]["target"]
+        else:
+            raise ValueError(f"Invalid text field: {text_field}")
+
+        if not data_args.add_instructions:
+            self.paired_dataset = self.paired_dataset.map(lambda x: remove_mmeb_instructions_eval(x, instruction),batched=True,batch_size=2048,drop_last_batch=False)
         print_rank(f"{subset} {text_field}: {len(self.paired_data)} unique pairs")
 
     def __len__(self):

@@ -44,7 +44,9 @@ fi
 ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
   --lora \
-  --subset_name CIRR \
+  --lora_name_or_path "/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/openai/clip-vit-large-patch14/CIRR-10epoch-lr3e-5_weight_decay1e-2" \
+  --lora_merge_coeff 0.5 \
+  --subset_name MSCOCO_i2t \
   --output_dir "$OUTPUT_DIR" \
   --run_name "$EXP_NAME" \
   --num_train_epochs 10 \

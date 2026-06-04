@@ -22,7 +22,7 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
 cd /home/thuy0050/code/vlmcl/src/tevatron
 
 MODEL_NAME=openai/clip-vit-large-patch14
-EXP_NAME=CIRR-2k-steps-lr3e-5
+EXP_NAME=CIRR-10epoch-lr3e-5_weight_decay1e-2
 
 OUTPUT_BASE_DIR=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl
 OUTPUT_DIR=$OUTPUT_BASE_DIR/$MODEL_NAME/$EXP_NAME
@@ -37,6 +37,7 @@ ulimit -n 8192 && ${LAUNCHER} hyperbolic/eval.py \
   --model_name_or_path "$MODEL_NAME" \
   --bf16 \
   --lora \
+  --lora_merge_coeff 0.9 \
   --lora_name_or_path "$OUTPUT_DIR" \
   --image_dir /home/thuy0050/ft49_scratch2/thuy0050/data/MMEB/MMEB-eval/image-tasks \
   --subset_name CIRR \

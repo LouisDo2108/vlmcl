@@ -48,7 +48,11 @@ def main():
     _maybe_enable_wandb(training_args)
 
     processor = load_clip_processor(model_args)
-    model = CLIPContrastiveModel.build(model_args)
+    
+    if model_args.lora and model_args.lora_name_or_path:
+        model = CLIPContrastiveModel.load_merge_build(model_args)
+    else:
+        model = CLIPContrastiveModel.build(model_args)
 
     # Print trainable params once before training begins (rank 0 only).
     if training_args.local_rank in [-1, 0]:

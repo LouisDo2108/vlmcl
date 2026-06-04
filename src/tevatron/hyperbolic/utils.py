@@ -182,7 +182,7 @@ def get_params_info(model):
     all_param = 0
     trainable_param = 0
 
-    print("\nAll trainable parameters:")
+    print_master("\nAll trainable parameters:")
     for name, param in model.named_parameters():
 
         if name.startswith("base_model."):
@@ -192,9 +192,10 @@ def get_params_info(model):
 
         if param.requires_grad:
             trainable_param += param.numel()
-            print(name, param.numel())
+            print_master(f"{name}: {param.numel()}")
+        # print_master(f"{name}: {param.numel()}, trainable: {param.requires_grad}")
 
-    print(
+    print_master(
         f"trainable params: {trainable_param:,} || all params: {all_param:,} || trainable%: {trainable_param / all_param * 100:.2f}"
     )
 

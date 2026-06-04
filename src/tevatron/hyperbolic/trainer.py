@@ -67,7 +67,8 @@ class CLIPGradCacheTrainer(CLIPTrainer):
 
     def training_step(self, model, inputs, num_items_in_batch=None) -> torch.Tensor:
         model.train()
-        queries, targets = inputs
+        # Move full qry/tgt batches to device once; GradCache chunks on GPU (see retriever gc_trainer).
+        queries, targets = self._prepare_inputs(inputs)
         self.gc.models = [model, model]
         use_no_sync = (
             dist.is_initialized()
@@ -77,8 +78,5 @@ class CLIPGradCacheTrainer(CLIPTrainer):
                 for m in self.gc.models
             )
         )
-        # Pass inner CLIP batch dicts directly so each GradCache stream chunk is:
-        # {"input_ids": ..., "attention_mask": ..., "pixel_values": ...}
         loss = self.gc({"qry": queries}, {"tgt": targets}, no_sync_except_last=use_no_sync)
-        # loss = self.gc(queries, targets, no_sync_except_last=use_no_sync)
         return loss / self._dist_loss_scale_factor

@@ -30,35 +30,64 @@ class CLIPContrastiveModel(nn.Module):
             self.process_rank = dist.get_rank()
             self.world_size = dist.get_world_size()
 
-    def encode_input(self, inputs: Dict[str, Tensor]) -> Tensor:
-        image_features, text_features = None, None
+    @property
+    def device(self) -> torch.device:
+        return self.encoder.device
 
-        pixel_values = inputs.get("pixel_values")
-        image_features = self.encoder.get_image_features(pixel_values=pixel_values)
-        # if pixel_values is not None and pixel_values.abs().sum() > 0:
-        #     has_image = pixel_values.flatten(1).abs().sum(dim=1) > 0
-        #     if has_image.any():
-        #         image_features = self.encoder.get_image_features(pixel_values=pixel_values)
-        #         if not has_image.all():
-        #             image_features = image_features.clone()
-        #             image_features[~has_image] = 0
+    def _fuse_multimodal_features(
+        self,
+        image_features: Tensor,
+        text_features: Tensor,
+        has_image: Tensor,
+        has_text: Tensor,
+    ) -> Tensor:
+        """
+        Per-sample fusion for mixed-modality batches.
 
-        input_ids = inputs.get("input_ids")
-        attention_mask = inputs.get("attention_mask")
-        if input_ids is not None:
-            text_features = self.encoder.get_text_features(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+        Each row independently uses text-only, image-only, or image+text:
+          text only  -> text_features
+          image only -> image_features
+          both       -> image_features + text_features (VLM2Vec approach)
+        Placeholder inputs are masked out before fusion.
+        """
+        has_image = has_image.to(device=image_features.device, dtype=torch.bool)
+        has_text = has_text.to(device=text_features.device, dtype=torch.bool)
+
+        if (~has_image & ~has_text).any():
+            raise ValueError(
+                "Batch contains samples with neither text nor image; "
+                "check dataset filtering."
             )
 
-        if image_features is not None and text_features is not None:
-            reps = image_features + text_features
-        elif image_features is not None:
-            reps = image_features
-        elif text_features is not None:
-            reps = text_features
-        else:
-            raise ValueError("Batch must contain text and/or image inputs.")
+        img_mask = has_image.unsqueeze(-1).to(dtype=image_features.dtype)
+        txt_mask = has_text.unsqueeze(-1).to(dtype=text_features.dtype)
+        return image_features * img_mask + text_features * txt_mask
+
+    def encode_input(self, inputs: Dict[str, Tensor]) -> Tensor:
+        """
+        Expects collator batch dicts already on the encoder device (Trainer._prepare_inputs
+        or eval batch_to_device). GradCache splits those GPU tensors into chunks.
+        """
+        has_image = inputs.get("has_image")
+        has_text = inputs.get("has_text")
+        if has_image is None or has_text is None:
+            raise ValueError("Batch must include has_image and has_text from the collator.")
+
+        input_ids = inputs["input_ids"]
+        pixel_values = inputs["pixel_values"]
+        attention_mask = inputs["attention_mask"]
+
+        image_features = self.encoder.get_image_features(
+            pixel_values=pixel_values
+        )
+        text_features = self.encoder.get_text_features(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        reps = self._fuse_multimodal_features(
+            image_features, text_features, has_image, has_text
+        )
 
         if self.normalize:
             reps = F.normalize(reps, p=2, dim=-1)
@@ -84,7 +113,7 @@ class CLIPContrastiveModel(nn.Module):
                 return CLIPModel.from_pretrained(model_name_or_path, **load_kwargs)
 
     @classmethod
-    def build(cls, model_args: ModelArguments, training_args: TrainingArguments = None, **kwargs):
+    def build(cls, model_args: ModelArguments, **kwargs):
         dtype = kwargs.pop("torch_dtype", torch.bfloat16)
         hf_kwargs = {"torch_dtype": dtype, **kwargs}
         base_model = cls.load_clip_encoder(model_args.model_name_or_path, **hf_kwargs)
@@ -143,11 +172,18 @@ class CLIPContrastiveModel(nn.Module):
                 **hf_kwargs,
             )
             print_master(f"Loading LoRA checkpoint from {adapter_path}")
+            
+            if model_args.lora_merge_coeff != 1.0:
+                print_master(f"Merging LoRA with merge coefficient {model_args.lora_merge_coeff}")
+                setattr(lora_config, "lora_alpha", int(lora_config.lora_alpha * model_args.lora_merge_coeff))
+                print_master(f"lora_config.lora_alpha: {lora_config.lora_alpha}")
+            
             lora_model = PeftModel.from_pretrained(
                 base_model,
                 adapter_path,
                 config=lora_config,
             )
+
             encoder = lora_model.merge_and_unload()
         else:
             print_master(f"This is not a PEFT model!!! ")
@@ -155,6 +191,44 @@ class CLIPContrastiveModel(nn.Module):
                 model_args.model_name_or_path,
                 **hf_kwargs,
             )
+
+        return cls(
+            encoder=encoder,
+            normalize=model_args.normalize,
+            temperature=model_args.temperature,
+        )
+
+    @classmethod
+    def load_merge_build(
+        cls, model_args: ModelArguments, training_args: TrainingArguments = None, **kwargs
+    ):
+        """
+        Continual LoRA: load and merge a prior adapter via load(), then attach new LoRA.
+        """
+        if not model_args.lora_name_or_path:
+            raise ValueError("load_merge_build requires --lora_name_or_path.")
+        if not model_args.lora:
+            raise ValueError("load_merge_build requires --lora to initialize new adapters.")
+
+        merged_model = cls.load(model_args, **kwargs)
+        merged_model.peft_config = None # Reset PEFT config to avoid merge_and_unload issues
+        
+        lora_config = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            target_modules=(
+                model_args.lora_target_modules
+                if model_args.lora_target_modules == "all-linear"
+                else model_args.lora_target_modules.split(",")
+            ),
+            lora_dropout=model_args.lora_dropout,
+            init_lora_weights="gaussian",
+            use_dora=False,
+            inference_mode=False,
+        )
+        encoder = get_peft_model(merged_model.encoder, lora_config)
+        print_master("Initialized new LoRA on merged encoder")
+        print_master(f"Active adapters: {encoder.active_adapters}")
 
         return cls(
             encoder=encoder,

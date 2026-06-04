@@ -144,61 +144,62 @@ def main():
         eval_data = load_dataset("TIGER-Lab/MMEB-eval", subset, split="test")
         pickles_exist = os.path.exists(encode_qry_path) and os.path.exists(encode_tgt_path)
 
-        if pickles_exist:
-            print_master(f"Loading cached embeddings for {subset}")
-            with open(encode_qry_path, "rb") as f:
-                qry_tensor, qry_index = pickle.load(f)
-            with open(encode_tgt_path, "rb") as f:
-                tgt_tensor, tgt_index = pickle.load(f)
-        else:
-            eval_qry_dataset = EvalDataset(
-                data_args=data_args,
-                subset=subset,
-                text_field="qry_text",
-                img_path_field="qry_img_path",
-                eval_data=eval_data,
-            )
-            eval_tgt_dataset = EvalDataset(
-                data_args=data_args,
-                subset=subset,
-                text_field="tgt_text",
-                img_path_field="tgt_img_path",
-                eval_data=eval_data,
-            )
-            eval_qry_loader = DataLoader(
-                eval_qry_dataset,
-                batch_size=training_args.per_device_eval_batch_size,
-                collate_fn=eval_collator,
-                shuffle=False,
-                drop_last=False,
-                num_workers=training_args.dataloader_num_workers,
-            )
-            eval_tgt_loader = DataLoader(
-                eval_tgt_dataset,
-                batch_size=training_args.per_device_eval_batch_size,
-                collate_fn=eval_collator,
-                shuffle=False,
-                drop_last=False,
-                num_workers=training_args.dataloader_num_workers,
-            )
-            qry_tensor, qry_index = encode_eval_dataset(
-                model,
-                eval_qry_loader,
-                device,
-                encode_qry_path,
-                eval_qry_dataset.paired_data,
-                is_query=True,
-                desc=f"{subset} encode query",
-            )
-            tgt_tensor, tgt_index = encode_eval_dataset(
-                model,
-                eval_tgt_loader,
-                device,
-                encode_tgt_path,
-                eval_tgt_dataset.paired_data,
-                is_query=False,
-                desc=f"{subset} encode target",
-            )
+        # Disable caching
+        # if pickles_exist:
+        #     print_master(f"Loading cached embeddings for {subset}")
+        #     with open(encode_qry_path, "rb") as f:
+        #         qry_tensor, qry_index = pickle.load(f)
+        #     with open(encode_tgt_path, "rb") as f:
+        #         tgt_tensor, tgt_index = pickle.load(f)
+        # else:
+        eval_qry_dataset = EvalDataset(
+            data_args=data_args,
+            subset=subset,
+            text_field="qry_text",
+            img_path_field="qry_img_path",
+            eval_data=eval_data,
+        )
+        eval_tgt_dataset = EvalDataset(
+            data_args=data_args,
+            subset=subset,
+            text_field="tgt_text",
+            img_path_field="tgt_img_path",
+            eval_data=eval_data,
+        )
+        eval_qry_loader = DataLoader(
+            eval_qry_dataset,
+            batch_size=training_args.per_device_eval_batch_size,
+            collate_fn=eval_collator,
+            shuffle=False,
+            drop_last=False,
+            num_workers=training_args.dataloader_num_workers,
+        )
+        eval_tgt_loader = DataLoader(
+            eval_tgt_dataset,
+            batch_size=training_args.per_device_eval_batch_size,
+            collate_fn=eval_collator,
+            shuffle=False,
+            drop_last=False,
+            num_workers=training_args.dataloader_num_workers,
+        )
+        qry_tensor, qry_index = encode_eval_dataset(
+            model,
+            eval_qry_loader,
+            device,
+            encode_qry_path,
+            eval_qry_dataset.paired_data,
+            is_query=True,
+            desc=f"{subset} encode query",
+        )
+        tgt_tensor, tgt_index = encode_eval_dataset(
+            model,
+            eval_tgt_loader,
+            device,
+            encode_tgt_path,
+            eval_tgt_dataset.paired_data,
+            is_query=False,
+            desc=f"{subset} encode target",
+        )
 
         qry_dict = _embeddings_to_dict(qry_tensor, qry_index)
         tgt_dict = _embeddings_to_dict(tgt_tensor, tgt_index)
