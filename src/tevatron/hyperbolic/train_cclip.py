@@ -1,3 +1,10 @@
+"""
+Train CCLIP / HyperbolicCCLIP (separate entry point from train.py).
+
+Dual objective = CLIP contrastive on fused embeddings + contrastive on projected
+embeddings. With --grad_cache, runs two GradCache passes (see trainer_cclip.py).
+"""
+
 import logging
 import os
 import sys
@@ -9,31 +16,12 @@ from tevatron.hyperbolic.arguments import (
 )
 from tevatron.hyperbolic.collator import CLIPCollator
 from tevatron.hyperbolic.dataset import CLIPTrainDataset
-from tevatron.hyperbolic.model import CLIPContrastiveModel
-from tevatron.hyperbolic.trainer import CLIPGradCacheTrainer, CLIPTrainer
+from tevatron.hyperbolic.model import CCLIP
+from tevatron.hyperbolic.train import _maybe_enable_wandb, load_clip_processor
+from tevatron.hyperbolic.trainer_cclip import CCLIPGradCacheTrainer, CCLIPTrainer
 from tevatron.hyperbolic.utils import get_params_info, init, print_master, print_rank
-from transformers import CLIPProcessor
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_enable_wandb(training_args):
-    """Enable wandb logging with minimal friction."""
-    report_to = training_args.report_to
-
-    if report_to == "none" or report_to == []:
-        return
-
-    training_args.report_to = "wandb"
-    os.environ.setdefault("WANDB_WATCH", "false")
-    os.environ.setdefault("WANDB_LOG_MODEL", "false")
-    print_master("Enabled wandb logging via training_args.report_to=wandb.")
-
-
-def load_clip_processor(model_args):
-    model_name = model_args.processor_name or model_args.model_name_or_path
-    print_master(f"Loading CLIPProcessor from {model_name}")
-    return CLIPProcessor.from_pretrained(model_name)
 
 
 def main():
@@ -42,24 +30,26 @@ def main():
             rank = arg.split("=", 1)[1]
             sys.argv.remove(arg)
             sys.argv.extend(["--local_rank", rank])
-    model_args, data_args, training_args = init(ModelArguments, DataArguments, TrainingArguments)
+
+    model_args, data_args, training_args = init(
+        ModelArguments, DataArguments, TrainingArguments
+    )
     _maybe_enable_wandb(training_args)
 
     processor = load_clip_processor(model_args)
-    
     if model_args.lora and model_args.lora_name_or_path:
-        model = CLIPContrastiveModel.load_merge_build(model_args)
-    else:
-        model = CLIPContrastiveModel.build(model_args)
+        raise NotImplementedError("Continual LoRA for CCLIP is not wired yet.")
+    model = CCLIP.build(model_args)
 
-    # Print trainable params once before training begins (rank 0 only).
     if training_args.local_rank in [-1, 0]:
         get_params_info(model)
 
     train_dataset = CLIPTrainDataset(data_args)
     collator = CLIPCollator(data_args=data_args, processor=processor)
 
-    trainer_cls = CLIPGradCacheTrainer if training_args.grad_cache else CLIPTrainer
+    trainer_cls = (
+        CCLIPGradCacheTrainer if training_args.grad_cache else CCLIPTrainer
+    )
     print_rank(f"Trainer: {trainer_cls.__name__}, grad_cache={training_args.grad_cache}")
 
     trainer = trainer_cls(

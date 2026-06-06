@@ -1,5 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=fit
+#SBATCH --nodelist=m3u000,m3u001,m3u002,m3u003,m3u004,m3u005,m3u006,m3u007,m3u008
 #SBATCH --gres=gpu:A100:1
 #SBATCH --qos=fitq
 #SBATCH --account=mg61
@@ -20,9 +21,10 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
 
 cd /home/thuy0050/code/vlmcl/src/tevatron
 
+ROOT_DIR=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl
 MODEL_NAME_OR_PATH=openai/clip-vit-large-patch14
-EXP_NAME=test
-OUTPUT_DIR=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/$MODEL_NAME_OR_PATH/$EXP_NAME
+EXP_NAME=test # CIRR-10epoch_bidirectional_loss
+OUTPUT_DIR=$ROOT_DIR/$MODEL_NAME_OR_PATH/$EXP_NAME
 mkdir -p "$OUTPUT_DIR"
 
 WANDB_PROJECT=${WANDB_PROJECT:-vlmcl}
@@ -41,10 +43,11 @@ if [[ "${TRAIN_MODE}" == "multi" && "${NPROC_PER_NODE}" -gt 1 ]]; then
 fi
 
 # CIRR MSCOCO_i2t MSCOCO_t2i NIGHTS VisDial VisualNews_i2t VisualNews_t2i WebQA
+for subset in CIRR MSCOCO_i2t MSCOCO_t2i VisDial WebQA; do
 ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
   --lora \
-  --subset_name CIRR \
+  --subset_name "$subset" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "$EXP_NAME" \
   --num_train_epochs 10 \
@@ -54,8 +57,16 @@ ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
   --gc_q_chunk_size 128 \
   --gc_p_chunk_size 128 \
   --dataloader_num_workers 8 \
-  --report_to none
+  --report_to wandb
 
-  # --max_steps 2000 \
-  # --warmup_steps 200 \
-  # --save_steps 1000 \
+# ulimit -n 8192 && ${LAUNCHER} hyperbolic/eval.py \
+#   --model_name_or_path "$MODEL_NAME_OR_PATH" \
+#   --bf16 \
+#   --lora \
+#   --lora_merge_coeff 1.0 \
+#   --lora_name_or_path "$OUTPUT_DIR" \
+#   --image_dir /home/thuy0050/mg61_scratch2/thuy0050/data/MMEB/MMEB-eval/image-tasks \
+#   --subset_name CIRR \
+#   --per_device_eval_batch_size 256 \
+#   --output_dir "$OUTPUT_DIR" \
+#   --run_name "$EXP_NAME"

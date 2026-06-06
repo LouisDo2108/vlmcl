@@ -7,13 +7,10 @@
 #SBATCH --output=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/logs/%x.out
 #SBATCH --error=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl/logs/%x.err
 #SBATCH --time=1-00:00:00
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=256G
-
-# Example: 2 nodes x 1 GPU each (world size = 2)
-# Launch with: sbatch train_multinode.sh
 
 source ~/.bashrc
 mamba activate tmrl

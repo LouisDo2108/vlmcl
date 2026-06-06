@@ -207,6 +207,7 @@ def main():
         test_cases = build_ranking_test_cases(
             eval_data, qry_dict, tgt_dict, normalize=model_args.normalize
         )
+
         score_dict = metrics.evaluate(test_cases)
         for k, v in score_dict.items():
             score_dict[k] = round(v, 4)

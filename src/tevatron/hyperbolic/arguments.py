@@ -36,7 +36,7 @@ class DataArguments(TevatronDataArguments):
         default=100000, metadata={"help": "Cap training rows per subset (optional)"}
     )
     image_dir: str = field(
-        default="/home/thuy0050/ft49_scratch2/thuy0050/data/MMEB/MMEB-train",
+        default="/home/thuy0050/mg61_scratch2/thuy0050/data/MMEB/MMEB-train",
         metadata={"help": "Root of MMEB-train parquet + image files"},
     )
     max_len: Optional[int] = field(
@@ -51,6 +51,12 @@ class DataArguments(TevatronDataArguments):
 
 @dataclass
 class TrainingArguments(TevatronTrainingArguments):
+    bidirectional_loss: bool = field(
+        default=True,
+        metadata={
+            "help": "Average query->target and target->query contrastive loss (CLIP-style)"
+        },
+    )
     grad_cache: bool = field(
         default=True, metadata={"help": "Use GradCache for memory-efficient training"}
     )

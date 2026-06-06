@@ -267,3 +267,41 @@ class CLIPContrastiveModel(nn.Module):
         dist.all_gather(gathered, t)
         gathered[self.process_rank] = t
         return torch.cat(gathered, dim=0)
+
+
+class CCLIP(CLIPContrastiveModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.old_checkpoint = None
+        hidden = self.encoder.config.hidden_size
+        """
+        Introduce a projector $h_\psi\colon \mathcal{Z}\rightarrow\mathcal{Z}$ 
+        after the vision and text encoders, optimizing the model in the 
+        projected space to keep the new and old feature spaces connected but 
+        not identical.
+        """
+        self.cclip_projector = nn.Linear(hidden, hidden, bias=False)
+        
+    
+
+    def forward(
+        self,
+        qry: Optional[Dict[str, Tensor]] = None,
+        tgt: Optional[Dict[str, Tensor]] = None,
+        **kwargs,
+    ):
+        # GradCache: each tower calls forward with only qry= or tgt=.
+        if qry is not None and tgt is None:
+            fn = getattr(self, getattr(self, "_gc_encode_method", "encode_input"))
+            return fn(qry)
+        if tgt is not None and qry is None:
+            fn = getattr(self, getattr(self, "_gc_encode_method", "encode_input"))
+            return fn(tgt)
+        return super().forward(qry=qry, tgt=tgt, **kwargs)
+
+
+# class HyperbolicCCLIP(CCLIP):
+#     def __init__(self, *args, **kwargs):
+#         super().__init__(*args, **kwargs)
+#         hidden = self.encoder.config.hidden_size
+#         self.hyperbolic_projector = nn.Linear(hidden, hidden, bias=False)

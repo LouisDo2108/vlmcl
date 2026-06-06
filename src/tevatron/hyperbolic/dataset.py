@@ -13,51 +13,53 @@ MMEB_IMAGE_TOKEN = "<|image_1|>"
 MMEB_retrieval_instruction_dict = {
     "CIRR": {
         "query": "Given an image, find a similar everyday image with the described changes:",
-        "target": "Represent the given image.\n",
+        "target": "Represent the given image.",
     },
-    "FashionIQ": {
-        "query": "Find an image to match the fashion image and style note.\n",
-        "target": "Represent the given image.\n",
-    },
+    
     "NIGHTS": {
-        "query": "Find a day-to-day image that looks similar to the provided image.\n",
-        "target": "Represent the given image.\n",
-    },
-    "OVEN": {
-        "query": "Retrieve a Wikipedia imagedescription pair that provides evidence for the question of this image.\n",
-        "target": "Represent the given Wikipedia image with related text information.\n",
+        "query": "Find a day-to-day image that looks similar to the provided image.",
+        "target": "Represent the given image.",
     },
     "VisDial": {
-        "query": "Represent the given dialogue about an image, which is used for image retrieval.\n",
-        "target": "Represent the given image.\n",
+        "query": "Represent the given dialogue about an image, which is used for image retrieval:",
+        "target": "Represent the given image",
     },
     "VisualNews_i2t": {
-        "query": "Retrieve an image of this news caption.\n",
-        "target": "Represent the given image.\n",
-    },
-    "VisualNews_t2i": {
-        "query": "Find a caption for the news in the given photo.\n",
+        "query": "Find a caption for the news in the given photo.",
         "target": "",
     },
+    "VisualNews_t2i": {
+        "query": "Retrieve an image of this news caption.",
+        "target": "Represent the given image.",
+    },
     "MSCOCO_i2t": {
-        "query": "Find an image caption describing  the given everyday image.\n",
+        "query": "Find an image caption describing the given everyday image.",
         "target": "",
     },
     "MSCOCO_t2i": {
-        "query": "Find me an everyday image that matches the given caption.\n",
+        "query": "Find me an everyday image that matches the given caption:",
         "target": "Represent the given image.",
     },
     "WebQA": {
-        "query": "Find a Wikipedia image-passage pair that answers this question.\n",
-        "target": "Represent the given Wikipedia image with related text information.",
+        "query": "Find a Wikipedia image that answers this question:",
+        "target": "Represent the given Wikipedia image with related text information:",
     },
+    ### OOD tasks
     "EDIS": {
-        "query": "Find a news image that matches the provided caption.\n",
-        "target": "Represent the given image with related text information.",
+        "query": "Find a news image that matches the provided caption:",
+        "target": "Represent the given image with related text information:",
+    },
+    "FashionIQ": {
+        "query": "Find an image to match the fashion image and style note:",
+        "target": "Represent the given image.",
+    },
+    "OVEN": {
+        "query": "Retrieve a Wikipedia image-description pair that provides evidence for the question of this image:",
+        "target": "Represent the given Wikipedia image with related text information:",
     },
     "Wiki-SS-NQ": {
-        "query": "Find the document screenshot that  can answer the given query.\n",
-        "target": "Represent the given document screenshot.\n",
+        "query": "Find the document image that can answer the given query:",
+        "target": "Represent the given image",
     },
 }
 
@@ -155,6 +157,9 @@ class CLIPTrainDataset(Dataset):
         self._pos_text = self.train_data["pos_text"]
         self._qry_image_path = self.train_data["qry_image_path"]
         self._pos_image_path = self.train_data["pos_image_path"]
+        
+        print(self.train_data[0])
+        from pdb import set_trace; set_trace()
 
     def __len__(self):
         return len(self.train_data)
