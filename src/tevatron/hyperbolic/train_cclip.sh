@@ -23,7 +23,7 @@ cd /home/thuy0050/code/vlmcl/src/tevatron
 
 ROOT_DIR=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl
 MODEL_NAME_OR_PATH=openai/clip-vit-large-patch14
-EXP_NAME=CIRR
+EXP_NAME=CCLIP_CIRR
 OUTPUT_DIR=$ROOT_DIR/$MODEL_NAME_OR_PATH/$EXP_NAME
 mkdir -p "$OUTPUT_DIR"
 
@@ -45,9 +45,10 @@ fi
 # CIRR MSCOCO_i2t MSCOCO_t2i NIGHTS VisDial VisualNews_i2t VisualNews_t2i WebQA
 # for subset in CIRR MSCOCO_i2t MSCOCO_t2i VisDial WebQA; do
 for subset in CIRR; do
-ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
+ulimit -n 8192 && ${LAUNCHER} hyperbolic/train_cclip.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
   --lora \
+  --old_checkpoint_path "openai/clip-vit-large-patch14" \
   --subset_name "$subset" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "$EXP_NAME" \
@@ -58,5 +59,6 @@ ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
   --gc_q_chunk_size 128 \
   --gc_p_chunk_size 128 \
   --dataloader_num_workers 8 \
-  --report_to wandb
+  --old_embedding_cache_path "$OUTPUT_DIR/old_embedding_cache.pt" \
+  --report_to none
 done

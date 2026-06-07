@@ -70,6 +70,7 @@ class CLIPCollator:
 
     data_args: DataArguments
     processor: CLIPProcessor
+    return_indices: bool = False
     _max_length: int = field(init=False, repr=False)
     _pixel_shape: Tuple[int, int, int] = field(init=False, repr=False)
 
@@ -86,9 +87,16 @@ class CLIPCollator:
         )
 
     def __call__(self, examples):
+        indices = None
+        if self.return_indices:
+            indices = [ex[1] for ex in examples]
+            examples = [ex[0] for ex in examples]
         qry_examples = [ex[0] for ex in examples]
         pos_examples = [ex[1] for ex in examples]
-        return self._batch(qry_examples), self._batch(pos_examples)
+        batches = self._batch(qry_examples), self._batch(pos_examples)
+        if indices is None:
+            return batches
+        return (*batches, torch.tensor(indices, dtype=torch.long))
 
     def _batch(self, examples: Sequence) -> dict:
         """

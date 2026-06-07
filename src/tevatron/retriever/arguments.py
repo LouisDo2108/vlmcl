@@ -219,4 +219,7 @@ class TevatronTrainingArguments(TrainingArguments):
         default=0.02,
         metadata={"help": "temperature for distillation"}
     )
-    
+
+    old_checkpoint_path: str = field(
+        default=None, metadata={"help": "Path to old checkpoint for CCLIP"}
+    )

@@ -22,7 +22,6 @@ class CLIPTrainer(TevatronTrainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._signature_columns = []
         self.loss_fn = build_contrastive_loss(
             is_ddp=self.is_ddp,
             temperature=self.model.temperature,

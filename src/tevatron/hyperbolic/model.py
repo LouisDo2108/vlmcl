@@ -34,6 +34,19 @@ class CLIPContrastiveModel(nn.Module):
     def device(self) -> torch.device:
         return self.encoder.device
 
+    @property
+    def rep_dim(self) -> int:
+        """Output dim of get_image/get_text_features (CLIP uses projection_dim)."""
+        config = self.encoder.config
+        if getattr(config, "projection_dim", None) is not None:
+            return config.projection_dim
+        if getattr(config, "hidden_size", None) is not None:
+            return config.hidden_size
+        return config.text_config.hidden_size
+
+    def encode_clip_input(self, inputs: Dict[str, Tensor]) -> Tensor:
+        return self.encode_input(inputs)
+
     def _fuse_multimodal_features(
         self,
         image_features: Tensor,
@@ -136,7 +149,7 @@ class CLIPContrastiveModel(nn.Module):
             normalize=model_args.normalize,
             temperature=model_args.temperature,
         )
-    
+
     @classmethod
     def load(cls, model_args: ModelArguments, **kwargs):
         """
@@ -172,12 +185,12 @@ class CLIPContrastiveModel(nn.Module):
                 **hf_kwargs,
             )
             print_master(f"Loading LoRA checkpoint from {adapter_path}")
-            
+
             if model_args.lora_merge_coeff != 1.0:
                 print_master(f"Merging LoRA with merge coefficient {model_args.lora_merge_coeff}")
                 setattr(lora_config, "lora_alpha", int(lora_config.lora_alpha * model_args.lora_merge_coeff))
                 print_master(f"lora_config.lora_alpha: {lora_config.lora_alpha}")
-            
+
             lora_model = PeftModel.from_pretrained(
                 base_model,
                 adapter_path,
@@ -212,7 +225,7 @@ class CLIPContrastiveModel(nn.Module):
 
         merged_model = cls.load(model_args, **kwargs)
         merged_model.peft_config = None # Reset PEFT config to avoid merge_and_unload issues
-        
+
         lora_config = LoraConfig(
             r=model_args.lora_r,
             lora_alpha=model_args.lora_alpha,
@@ -258,7 +271,7 @@ class CLIPContrastiveModel(nn.Module):
             all_tgt_reps = self._dist_gather_tensor(tgt_reps)
         else:
             all_qry_reps, all_tgt_reps = qry_reps, tgt_reps
-            
+        
         return all_qry_reps, all_tgt_reps
 
     def _dist_gather_tensor(self, t: Tensor) -> Tensor:
@@ -272,36 +285,60 @@ class CLIPContrastiveModel(nn.Module):
 class CCLIP(CLIPContrastiveModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.old_checkpoint = None
-        hidden = self.encoder.config.hidden_size
+        hidden = self.rep_dim
+        enc_dtype = next(self.encoder.parameters()).dtype
         """
         Introduce a projector $h_\psi\colon \mathcal{Z}\rightarrow\mathcal{Z}$ 
         after the vision and text encoders, optimizing the model in the 
         projected space to keep the new and old feature spaces connected but 
         not identical.
         """
-        self.cclip_projector = nn.Linear(hidden, hidden, bias=False)
+        self.cclip_projector = nn.Linear(
+            hidden, hidden, bias=False, dtype=enc_dtype
+        )
         
-    
-
     def forward(
         self,
         qry: Optional[Dict[str, Tensor]] = None,
         tgt: Optional[Dict[str, Tensor]] = None,
+        ckc=False,
         **kwargs,
     ):
-        # GradCache: each tower calls forward with only qry= or tgt=.
-        if qry is not None and tgt is None:
-            fn = getattr(self, getattr(self, "_gc_encode_method", "encode_input"))
-            return fn(qry)
-        if tgt is not None and qry is None:
-            fn = getattr(self, getattr(self, "_gc_encode_method", "encode_input"))
-            return fn(tgt)
+        if ckc:
+            if qry is None or tgt is None:
+                raise ValueError("ckc=True requires both qry and tgt.")
+            # q_bs = qry["input_ids"].size(0)
+            # t_bs = tgt["input_ids"].size(0)
+            # if q_bs != t_bs:
+            #     raise ValueError(
+            #         f"ckc qry/tgt batch sizes must match, got {q_bs} and {t_bs}."
+            #     )
+            return self.encode_ckc_reps(qry, tgt)
+
         return super().forward(qry=qry, tgt=tgt, **kwargs)
 
 
-# class HyperbolicCCLIP(CCLIP):
-#     def __init__(self, *args, **kwargs):
-#         super().__init__(*args, **kwargs)
-#         hidden = self.encoder.config.hidden_size
-#         self.hyperbolic_projector = nn.Linear(hidden, hidden, bias=False)
+    def _project(self, reps: Tensor) -> Tensor:
+        reps = self.cclip_projector(reps)
+        if self.normalize:
+            reps = F.normalize(reps, p=2, dim=-1)
+        return reps
+
+    def encode_projected_input(self, inputs: Dict[str, Tensor]) -> Tensor:
+        return self._project(self.encode_input(inputs))
+
+    def project_ckc_from_clip_reps(
+        self, qry_reps: Tensor, tgt_reps: Tensor
+    ) -> Tensor:
+        """Project cached CLIP reps and interleave: [proj_q..., proj_t...]."""
+        return torch.cat(
+            [self._project(qry_reps), self._project(tgt_reps)], dim=0
+        )
+
+    def encode_ckc_reps(
+        self, qry: Dict[str, Tensor], tgt: Dict[str, Tensor]
+    ) -> Tensor:
+        """Full encode + project path (non-GradCache fallback)."""
+        qry_reps = self.encode_input(qry)
+        tgt_reps = self.encode_input(tgt)
+        return self.project_ckc_from_clip_reps(qry_reps, tgt_reps)

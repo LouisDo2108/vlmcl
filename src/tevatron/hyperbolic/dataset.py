@@ -142,8 +142,9 @@ def _load_mmeb_train_subset(data_args: DataArguments, subset: str):
 class CLIPTrainDataset(Dataset):
     """MMEB parquet rows as CLIP (text, image) pairs for query and positive."""
 
-    def __init__(self, data_args: DataArguments):
+    def __init__(self, data_args: DataArguments, return_index: bool = False):
         self.data_args = data_args
+        self.return_index = return_index
         self._image_root = data_args.image_dir
         subsets = []
         print_rank(f"Loading {len(data_args.subset_name)} subsets: {data_args.subset_name}")
@@ -157,9 +158,6 @@ class CLIPTrainDataset(Dataset):
         self._pos_text = self.train_data["pos_text"]
         self._qry_image_path = self.train_data["qry_image_path"]
         self._pos_image_path = self.train_data["pos_image_path"]
-        
-        print(self.train_data[0])
-        from pdb import set_trace; set_trace()
 
     def __len__(self):
         return len(self.train_data)
@@ -191,7 +189,8 @@ class CLIPTrainDataset(Dataset):
         pos_text, pos_image = self._pair_text_image(
             self._pos_text[idx], self._load_image(self._pos_image_path[idx])
         )
-        return (qry_text, qry_image), (pos_text, pos_image)
+        pair = (qry_text, qry_image), (pos_text, pos_image)
+        return (pair, idx) if self.return_index else pair
 
 
 class EvalDataset(Dataset):

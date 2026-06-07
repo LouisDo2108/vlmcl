@@ -41,6 +41,8 @@ class SimpleContrastiveLoss:
     ) -> Tensor:
         if target is None:
             target = _diagonal_targets(x, y)
+        if y.dtype != x.dtype:
+            y = y.to(dtype=x.dtype)
         logits = torch.matmul(x, y.transpose(0, 1))
         return F.cross_entropy(logits / self.temperature, target, reduction=reduction)
 

@@ -77,3 +77,12 @@ class TrainingArguments(TevatronTrainingArguments):
     remove_unused_columns: bool = field(default=False, metadata={"help": "Remove unused columns"})
     logging_steps: int = field(default=10, metadata={"help": "Logging steps"})
     bf16: bool = field(default=True, metadata={"help": "Use BF16 mixed precision training"})
+    old_embedding_cache_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to precomputed old-checkpoint training embeddings for CKC. "
+                "Built automatically on first run when old_checkpoint_path is set."
+            )
+        },
+    )
