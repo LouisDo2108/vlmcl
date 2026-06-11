@@ -73,7 +73,7 @@ ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
   --gc_p_chunk_size 256 \
   --dataloader_num_workers 8 \
   --old_embedding_cache_path "$OUTPUT_DIR/old_embedding_cache.pt" \
+  --torch_compile True \
   --report_to wandb
-done
 
   # --old_checkpoint_path "openai/clip-vit-large-patch14" \

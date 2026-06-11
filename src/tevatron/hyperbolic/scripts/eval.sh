@@ -24,33 +24,30 @@ cd /home/thuy0050/code/vlmcl/src/tevatron
 ROOT_DIR=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl
 BASE_MODEL=openai/clip-vit-large-patch14
 
-CURRENT_EXP="CCLIP_CIRR"
+CURRENT_EXP="MSCOCO_i2t"
 LORA_NAME_OR_PATH=(
-"$ROOT_DIR/$BASE_MODEL/CCLIP_CIRR"
-# "$ROOT_DIR/$BASE_MODEL/CCLIP_MSCOCO_i2t"
+"$ROOT_DIR/$BASE_MODEL/CIRR"
+"$ROOT_DIR/$BASE_MODEL/MSCOCO_i2t"
 )
 EVAL_SUBSETS=(
-  "CIRR" # I + T -> I
-  "MSCOCO_i2t" # I -> T
-  "MSCOCO_t2i" # T -> I
+  # "CIRR" # I + T -> I
+  # "MSCOCO_i2t" # I -> T
+  # "MSCOCO_t2i" # T -> I
   # "VisDial" # T -> I
   # "WebQA" # T -> I + T
   # "NIGHTS" # I -> I Consider remove due to single modality
   # "VisualNews_i2t" # I -> T Consider remove due to high zero-shot performance
   # "VisualNews_t2i" # T -> I Consider remove due to high zero-shot performance
   # "FashionIQ" # OOD
-  # "OVEN" # OOD
+  "OVEN" # OOD
   # "Wiki-SS-NQ" # OOD
   # "EDIS" # OOD, T -> I +T Consider remove due to high zero-shot performance
 )
 
 LAUNCHER="python"
-# CIRR MSCOCO_i2t MSCOCO_t2i NIGHTS VisDial VisualNews_i2t VisualNews_t2i WebQA
-# EDIS FashionIQ OVEN Wiki-SS-NQ
-
 ulimit -n 8192 && ${LAUNCHER} hyperbolic/eval.py \
   --model_name_or_path "$BASE_MODEL" \
-  --lora_merge_coeff 0.5 \
+  --lora_merge_coeff 1.0 \
   --lora_name_or_path "${LORA_NAME_OR_PATH[@]}" \
   --image_dir /home/thuy0050/mg61_scratch2/thuy0050/data/MMEB/MMEB-eval/image-tasks \
   --subset_name "${EVAL_SUBSETS[@]}" \

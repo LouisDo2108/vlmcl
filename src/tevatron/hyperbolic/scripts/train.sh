@@ -44,8 +44,8 @@ fi
 
 TRAIN_SUBSETS=(
   "CIRR" # I + T -> I
-  "MSCOCO_i2t" # I -> T
-  "MSCOCO_t2i" # T -> I
+  # "MSCOCO_i2t" # I -> T
+  # "MSCOCO_t2i" # T -> I
   # "VisDial" # T -> I
   # "WebQA" # T -> I + T
   # "NIGHTS" # I -> I Consider remove due to single modality
@@ -60,14 +60,15 @@ TRAIN_SUBSETS=(
 ulimit -n 8192 && ${LAUNCHER} hyperbolic/train.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
   --lora \
-  --subset_name "$subset" \
+  --subset_name "${TRAIN_SUBSETS[@]}" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "$EXP_NAME" \
   --num_train_epochs 10 \
   --learning_rate 3e-5 \
-  --per_device_train_batch_size 1024 \
+  --per_device_train_batch_size 256 \
   --grad_cache True \
   --gc_q_chunk_size 256 \
   --gc_p_chunk_size 256 \
   --dataloader_num_workers 8 \
+  --torch_compile True \
   --report_to none

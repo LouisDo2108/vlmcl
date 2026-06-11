@@ -209,13 +209,13 @@ class CLIPContrastiveModel(nn.Module):
             encoder = cls._merge_lora_into_encoder(
                 encoder, adapter_path, merge_coeff
             )
+        print_master("-----END LOADING MERGED ADAPTERS-----")
 
         return cls(
             encoder=encoder,
             normalize=model_args.normalize,
             temperature=model_args.temperature,
         )
-        print_master("-----END LOADING MERGED ADAPTERS-----")
 
     @classmethod
     def load(cls, model_args: ModelArguments, **kwargs):

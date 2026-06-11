@@ -33,7 +33,7 @@ def encode_eval_dataset(
     *,
     is_query: bool,
     desc: str,
-) -> np.ndarray:
+) -> torch.Tensor:
     """Encode query or target loader and save (embeddings, paired_data) pickle."""
     encoded = []
     device_type = device.type if isinstance(device, torch.device) else "cuda"
@@ -43,8 +43,8 @@ def encode_eval_dataset(
                 batch = batch_to_device(batch, device)
                 output = model(qry=batch) if is_query else model(tgt=batch)
                 key = "qry_reps" if is_query else "tgt_reps"
-                encoded.append(output[key].cpu().float().numpy())
-    encoded = np.concatenate(encoded, axis=0).astype(np.float16)
+                encoded.append(output[key].detach().cpu())
+    encoded = torch.cat(encoded, dim=0).to(torch.bfloat16)
 
     with open(output_path, "wb") as f:
         pickle.dump((encoded, paired_data), f)
@@ -60,6 +60,12 @@ def _embeddings_to_dict(tensor, index):
     return {_pair_key(m["text"], m["img_path"]): t for t, m in zip(tensor, index)}
 
 
+def _to_float32(x) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        return x.float().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+
 def build_ranking_test_cases(eval_data, qry_dict, tgt_dict, *, normalize: bool):
     """
     One test case per MMEB row: rank row-specific candidates; GT is index 0.
@@ -69,12 +75,9 @@ def build_ranking_test_cases(eval_data, qry_dict, tgt_dict, *, normalize: bool):
     test_cases = []
     for row in eval_data:
         qry_key = _pair_key(row["qry_text"], row["qry_img_path"])
-        qry_t = np.asarray(qry_dict[qry_key], dtype=np.float32)
+        qry_t = _to_float32(qry_dict[qry_key])
         cand_keys = [_pair_key(t, p) for t, p in zip(row["tgt_text"], row["tgt_img_path"])]
-        tgt_t = np.stack(
-            [np.asarray(tgt_dict[k], dtype=np.float32) for k in cand_keys],
-            axis=0,
-        )
+        tgt_t = np.stack([_to_float32(tgt_dict[k]) for k in cand_keys], axis=0)
         if normalize:
             qry_norm = np.linalg.norm(qry_t)
             tgt_norms = np.linalg.norm(tgt_t, axis=1)
@@ -114,6 +117,7 @@ def main():
         model = CLIPContrastiveModel.load(model_args)
     model.eval()
     model = model.to(device, dtype=torch.bfloat16)
+    model.encoder = torch.compile(model.encoder) # type: ignore
 
     eval_collator = CLIPEvalCollator(data_args=data_args, processor=processor)
     metrics = RankingMetrics(metric_list=["hit", "ndcg"], k_list=(1, 5, 10))
