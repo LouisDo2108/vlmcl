@@ -115,11 +115,11 @@ def _load_mmeb_train_subset(data_args: DataArguments, subset: str):
         raise ValueError(
             f"Unknown subset {subset!r}; add it to MMEB_retrieval_instruction_dict"
         )
-    ds = load_dataset(
+    ds: datasets.Dataset = load_dataset(
         "parquet",
         data_dir=os.path.join(data_args.image_dir, subset),
         data_files={"original": "original-00000-of-00001.parquet"},
-    )["original"]
+    )["original"] # type: ignore
     if (
         data_args.num_sample_per_subset is not None
         and data_args.num_sample_per_subset < ds.num_rows

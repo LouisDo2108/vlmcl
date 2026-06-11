@@ -1,3 +1,5 @@
+import os
+
 """
 CCLIP training: two GradCache steps, both using SimpleContrastiveLoss.
 
@@ -13,9 +15,12 @@ import torch
 import torch.nn as nn
 from grad_cache.grad_cache import GradCache
 from tevatron.hyperbolic.collator import get_dense_rep
-from tevatron.hyperbolic.loss import build_contrastive_loss
-from tevatron.hyperbolic.model import CCLIP
-from tevatron.hyperbolic.old_embedding_cache import OldEmbeddingCache, cat_qry_tgt_by_chunk
+from tevatron.hyperbolic.loss import build_ckc_loss
+from tevatron.hyperbolic.model import CCLIP, HyperbolicCCLIP
+from tevatron.hyperbolic.old_embedding_cache import (
+    OldEmbeddingCache,
+    cat_qry_tgt_by_chunk,
+)
 from tevatron.hyperbolic.trainer import CLIPGradCacheTrainer, CLIPTrainer
 
 
@@ -145,6 +150,14 @@ def _build_ckc_new_reps_from_clip(
 class CCLIPTrainer(CLIPTrainer):
     """Non-GradCache path: CLIP loss + optional CKC loss when old embeddings are cached."""
 
+    def _save(self, output_dir=None, state_dict=None):
+        super()._save(output_dir, state_dict)
+        output_dir = output_dir or self.args.output_dir
+        torch.save(
+            _unwrap_model(self.model).cclip_projector.state_dict(),
+            os.path.join(output_dir, "cclip_projector.pt"),
+        )
+
     def __init__(self, *args, **kwargs):
         self.old_embedding_cache = kwargs.pop("old_embedding_cache", None)
         super().__init__(*args, **kwargs)
@@ -189,6 +202,14 @@ class CCLIPTrainer(CLIPTrainer):
 
 class CCLIPGradCacheTrainer(CLIPGradCacheTrainer):
     """CLIP GradCache step + optional CKC GradCache step against cached old embeddings."""
+
+    def _save(self, output_dir=None, state_dict=None):
+        super()._save(output_dir, state_dict)
+        output_dir = output_dir or self.args.output_dir
+        torch.save(
+            _unwrap_model(self.model).cclip_projector.state_dict(),
+            os.path.join(output_dir, "cclip_projector.pt"),
+        )
 
     def __init__(self, *args, **kwargs):
         self.old_embedding_cache: OldEmbeddingCache | None = kwargs.pop(

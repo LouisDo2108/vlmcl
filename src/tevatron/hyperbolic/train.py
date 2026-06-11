@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 def _maybe_enable_wandb(training_args):
-    """Enable wandb logging with minimal friction."""
     report_to = training_args.report_to
 
     if report_to == "none" or report_to == []:
@@ -42,11 +41,13 @@ def main():
             rank = arg.split("=", 1)[1]
             sys.argv.remove(arg)
             sys.argv.extend(["--local_rank", rank])
-    model_args, data_args, training_args = init(ModelArguments, DataArguments, TrainingArguments)
+    model_args, data_args, training_args = init(
+        ModelArguments, DataArguments, TrainingArguments
+    )
     _maybe_enable_wandb(training_args)
 
     processor = load_clip_processor(model_args)
-    
+
     if model_args.lora and model_args.lora_name_or_path:
         model = CLIPContrastiveModel.load_merge_build(model_args)
     else:

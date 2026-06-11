@@ -16,18 +16,12 @@ from tevatron.hyperbolic.collator import CLIPEvalCollator
 from tevatron.hyperbolic.dataset import EvalDataset
 from tevatron.hyperbolic.metrics import RankingMetrics
 from tevatron.hyperbolic.model import CLIPContrastiveModel
-from tevatron.hyperbolic.utils import batch_to_device, print_master, print_rank
+from tevatron.hyperbolic.train import load_clip_processor
+from tevatron.hyperbolic.utils import batch_to_device, init, print_master, print_rank
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import CLIPProcessor, HfArgumentParser
 
 logger = logging.getLogger(__name__)
-
-
-def load_clip_processor(model_args):
-    model_name = model_args.processor_name or model_args.model_name_or_path
-    print_master(f"Loading CLIPProcessor from {model_name}")
-    return CLIPProcessor.from_pretrained(model_name)
 
 
 def encode_eval_dataset(
@@ -104,35 +98,24 @@ def main():
             rank = arg.split("=", 1)[1]
             sys.argv.remove(arg)
             sys.argv.extend(["--local_rank", rank])
-
-    parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
-    else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-        model_args: ModelArguments
-        data_args: DataArguments
-        training_args: TrainingArguments
-
+    model_args, data_args, training_args = init(
+        ModelArguments, DataArguments, TrainingArguments, verbose=False
+    )
     if training_args.local_rank > 0 or training_args.n_gpu > 1:
         raise NotImplementedError("Multi-GPU eval is not supported.")
-
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
-    )
-
+    
     output_dir = training_args.output_dir
     device = torch.device(training_args.device)
 
     processor = load_clip_processor(model_args)
-    model = CLIPContrastiveModel.load(model_args)
+    if model_args.lora_name_or_path:
+        model = CLIPContrastiveModel.load_merged_adapters(model_args)
+    else:
+        model = CLIPContrastiveModel.load(model_args)
     model.eval()
     model = model.to(device, dtype=torch.bfloat16)
 
     eval_collator = CLIPEvalCollator(data_args=data_args, processor=processor)
-
     metrics = RankingMetrics(metric_list=["hit", "ndcg"], k_list=(1, 5, 10))
 
     for idx, subset in enumerate(data_args.subset_name):
@@ -142,9 +125,9 @@ def main():
         score_path = os.path.join(output_dir, f"{subset}_score.json")
 
         eval_data = load_dataset("TIGER-Lab/MMEB-eval", subset, split="test")
-        pickles_exist = os.path.exists(encode_qry_path) and os.path.exists(encode_tgt_path)
 
         # Disable caching
+        # pickles_exist = os.path.exists(encode_qry_path) and os.path.exists(encode_tgt_path)
         # if pickles_exist:
         #     print_master(f"Loading cached embeddings for {subset}")
         #     with open(encode_qry_path, "rb") as f:

@@ -22,24 +22,37 @@ export PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.6
 cd /home/thuy0050/code/vlmcl/src/tevatron
 
 ROOT_DIR=/home/thuy0050/mg61_scratch2/thuy0050/exp/vlmcl
-MODEL_NAME_OR_PATH=openai/clip-vit-large-patch14
-EXP_NAME=CIRR-10epoch_bidirectional_loss
-OUTPUT_DIR=$ROOT_DIR/$MODEL_NAME_OR_PATH/$EXP_NAME
-mkdir -p "$OUTPUT_DIR"
+BASE_MODEL=openai/clip-vit-large-patch14
 
+CURRENT_EXP="CCLIP_CIRR"
+LORA_NAME_OR_PATH=(
+"$ROOT_DIR/$BASE_MODEL/CCLIP_CIRR"
+# "$ROOT_DIR/$BASE_MODEL/CCLIP_MSCOCO_i2t"
+)
+EVAL_SUBSETS=(
+  "CIRR" # I + T -> I
+  "MSCOCO_i2t" # I -> T
+  "MSCOCO_t2i" # T -> I
+  # "VisDial" # T -> I
+  # "WebQA" # T -> I + T
+  # "NIGHTS" # I -> I Consider remove due to single modality
+  # "VisualNews_i2t" # I -> T Consider remove due to high zero-shot performance
+  # "VisualNews_t2i" # T -> I Consider remove due to high zero-shot performance
+  # "FashionIQ" # OOD
+  # "OVEN" # OOD
+  # "Wiki-SS-NQ" # OOD
+  # "EDIS" # OOD, T -> I +T Consider remove due to high zero-shot performance
+)
 
 LAUNCHER="python"
 # CIRR MSCOCO_i2t MSCOCO_t2i NIGHTS VisDial VisualNews_i2t VisualNews_t2i WebQA
-# EDIS FashionIQ OVEN Wiki-SS-NQ 
+# EDIS FashionIQ OVEN Wiki-SS-NQ
 
-# for subset in CIRR MSCOCO_i2t MSCOCO_t2i NIGHTS VisDial VisualNews_i2t VisualNews_t2i WebQA EDIS FashionIQ OVEN Wiki-SS-NQ; do
 ulimit -n 8192 && ${LAUNCHER} hyperbolic/eval.py \
-  --model_name_or_path "$MODEL_NAME_OR_PATH" \
-  --lora \
-  --lora_merge_coeff 1.0 \
-  --lora_name_or_path "$OUTPUT_DIR" \
+  --model_name_or_path "$BASE_MODEL" \
+  --lora_merge_coeff 0.5 \
+  --lora_name_or_path "${LORA_NAME_OR_PATH[@]}" \
   --image_dir /home/thuy0050/mg61_scratch2/thuy0050/data/MMEB/MMEB-eval/image-tasks \
-  --subset_name CIRR \
-  --output_dir "$OUTPUT_DIR" \
-  --run_name "$EXP_NAME"
-# done
+  --subset_name "${EVAL_SUBSETS[@]}" \
+  --output_dir "$ROOT_DIR/$BASE_MODEL/$CURRENT_EXP" \
+  --run_name "$CURRENT_EXP"

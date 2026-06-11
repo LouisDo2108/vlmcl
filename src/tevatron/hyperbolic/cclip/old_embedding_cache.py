@@ -148,8 +148,8 @@ def _encode_batches(
     num_samples: int,
     rep_dim: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    qry_rows = torch.empty((num_samples, rep_dim), dtype=torch.float16)
-    tgt_rows = torch.empty((num_samples, rep_dim), dtype=torch.float16)
+    qry_rows = torch.empty((num_samples, rep_dim), dtype=torch.bfloat16)
+    tgt_rows = torch.empty((num_samples, rep_dim), dtype=torch.bfloat16)
     device_type = device.type if isinstance(device, torch.device) else "cuda"
 
     old_model.eval()
@@ -160,10 +160,10 @@ def _encode_batches(
             ):
                 qry_batch = batch_to_device(qry_batch, device)
                 tgt_batch = batch_to_device(tgt_batch, device)
-                old_q = old_model.encode_clip_input(qry_batch).detach().cpu()
-                old_t = old_model.encode_clip_input(tgt_batch).detach().cpu()
-                qry_rows[batch_indices] = old_q.to(dtype=torch.float16)
-                tgt_rows[batch_indices] = old_t.to(dtype=torch.float16)
+                old_q = old_model.encode_clip_input(qry_batch).detach().cpu() # type: ignore
+                old_t = old_model.encode_clip_input(tgt_batch).detach().cpu() # type: ignore
+                qry_rows[batch_indices] = old_q.to(dtype=torch.bfloat16)
+                tgt_rows[batch_indices] = old_t.to(dtype=torch.bfloat16)
 
     return qry_rows, tgt_rows
 
@@ -183,7 +183,7 @@ def build_old_embedding_cache(
     meta = OldEmbeddingCacheMeta.from_dataset(
         dataset,
         old_checkpoint_path,
-        rep_dim=old_model.rep_dim,
+        rep_dim=old_model.rep_dim, # type: ignore
     )
     resolved_path = cache_path or default_cache_path(output_dir, meta)
 

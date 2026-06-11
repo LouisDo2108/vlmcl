@@ -25,6 +25,29 @@ class ModelArguments(TevatronModelArguments):
         default="qkv_proj,o_proj,gate_up_proj,down_proj,k_proj,q_proj,out_proj,v_proj,gate_proj,up_proj",# "all-linear"
     )
     lora_merge_coeff: float = field(default=1.0, metadata={"help": "LoRA merge coefficient used in C-CLIP"})
+    lora_name_or_path: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": "LoRA checkpoint dir(s) to merge sequentially (in task order)."
+        },
+    )
+    hyperbolic: bool = field(
+        default=False,
+        metadata={"help": "Use HyperbolicCCLIP (Poincaré ball CKC constraint)"},
+    )
+    curvature: float = field(
+        default=1.0,
+        metadata={"help": "Poincaré ball curvature c (>0)"},
+    )
+    old_tangent_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Scale α for embedding old unit-sphere cache into the ball: "
+                "expmap0(α · y_old)"
+            )
+        },
+    )
 
 
 @dataclass
@@ -51,6 +74,12 @@ class DataArguments(TevatronDataArguments):
 
 @dataclass
 class TrainingArguments(TevatronTrainingArguments):
+    per_device_train_batch_size: int = field(
+        default=256, metadata={"help": "Batch size per device accelerator core/CPU for training."}
+    )
+    per_device_eval_batch_size: int = field(
+        default=256, metadata={"help": "Batch size per device accelerator core/CPU for evaluation."}
+    )
     bidirectional_loss: bool = field(
         default=True,
         metadata={

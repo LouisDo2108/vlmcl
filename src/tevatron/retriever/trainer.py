@@ -1,13 +1,13 @@
+import logging
 import os
 from typing import Optional
 
 import torch
-
-from transformers.trainer import Trainer, TRAINING_ARGS_NAME
 import torch.distributed as dist
+from transformers.trainer import TRAINING_ARGS_NAME, Trainer
+
 from .modeling import EncoderModel
 
-import logging
 logger = logging.getLogger(__name__)
 
 

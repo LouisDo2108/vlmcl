@@ -1,10 +1,3 @@
-"""
-Train CCLIP / HyperbolicCCLIP (separate entry point from train.py).
-
-Dual objective = CLIP contrastive on fused embeddings + contrastive on projected
-embeddings. With --grad_cache, runs two GradCache passes (see trainer_cclip.py).
-"""
-
 import copy
 import logging
 import os
@@ -18,7 +11,7 @@ from tevatron.hyperbolic.arguments import (
 )
 from tevatron.hyperbolic.collator import CLIPCollator
 from tevatron.hyperbolic.dataset import CLIPTrainDataset
-from tevatron.hyperbolic.model import CCLIP, CLIPContrastiveModel
+from tevatron.hyperbolic.model import CCLIP, CLIPContrastiveModel, HyperbolicCCLIP
 from tevatron.hyperbolic.old_embedding_cache import (
     OldEmbeddingCache,
     OldEmbeddingCacheMeta,
@@ -38,19 +31,24 @@ def main():
             rank = arg.split("=", 1)[1]
             sys.argv.remove(arg)
             sys.argv.extend(["--local_rank", rank])
-
     model_args, data_args, training_args = init(
         ModelArguments, DataArguments, TrainingArguments
     )
     _maybe_enable_wandb(training_args)
 
     processor = load_clip_processor(model_args)
+
     if model_args.lora and model_args.lora_name_or_path:
         raise NotImplementedError("Continual LoRA for CCLIP is not wired yet.")
-    model = CCLIP.build(model_args)
+    model_cls = HyperbolicCCLIP if model_args.hyperbolic else CCLIP
+    print_master(f"Building model: {model_cls.__name__}")
+    model = model_cls.build(model_args)
 
     old_embedding_cache = None
     if training_args.old_checkpoint_path:
+        """
+        Build old embedding cache from old checkpoint.
+        """
         train_dataset_for_cache = CLIPTrainDataset(data_args)
         cache_meta = OldEmbeddingCacheMeta.from_dataset(
             train_dataset_for_cache,
@@ -67,15 +65,18 @@ def main():
                 expected_meta=cache_meta,
             )
         else:
+        """
+        If old cache is not found, build it from old checkpoint, which is the pre-trained CLIP model or a LoRA-finetuned CLIP model.
+        """
             old_model_args = copy.deepcopy(model_args)
             if old_model_args.model_name_or_path == "OpenAI/clip-vit-large-patch14":
-                old_model_args.lora_name_or_path = None
+                old_model_args.lora_name_or_path = []
             else:
-                old_model_args.lora_name_or_path = training_args.old_checkpoint_path
+                old_model_args.lora_name_or_path = [training_args.old_checkpoint_path]
             print_master(
                 f"Loading old checkpoint from {old_model_args.lora_name_or_path}"
             )
-            old_checkpoint = CLIPContrastiveModel.load_merge_build(old_model_args)
+            old_checkpoint = CLIPContrastiveModel.load(old_model_args)
             old_checkpoint.eval()
             old_checkpoint.to(training_args.device)
 
@@ -106,9 +107,7 @@ def main():
         return_indices=use_ckc,
     )
 
-    trainer_cls = (
-        CCLIPGradCacheTrainer if training_args.grad_cache else CCLIPTrainer
-    )
+    trainer_cls = CCLIPGradCacheTrainer if training_args.grad_cache else CCLIPTrainer
     print_rank(f"Trainer: {trainer_cls.__name__}, grad_cache={training_args.grad_cache}")
 
     trainer = trainer_cls(

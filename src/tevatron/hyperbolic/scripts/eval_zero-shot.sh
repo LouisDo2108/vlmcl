@@ -29,16 +29,25 @@ OUTPUT_DIR=$ROOT_DIR/$MODEL_NAME_OR_PATH/$EXP_NAME
 
 mkdir -p "$OUTPUT_DIR"
 
+EVAL_SUBSETS=(
+  "CIRR" # I + T -> I
+  "MSCOCO_i2t" # I -> T
+  "MSCOCO_t2i" # T -> I
+  "VisDial" # T -> I
+  "WebQA" # T -> I + T
+  "NIGHTS" # I -> I Consider remove due to single modality
+  "VisualNews_i2t" # I -> T Consider remove due to high zero-shot performance
+  "VisualNews_t2i" # T -> I Consider remove due to high zero-shot performance
+  "FashionIQ" # OOD
+  "OVEN" # OOD
+  "Wiki-SS-NQ" # OOD
+  "EDIS" # OOD, T -> I +T Consider remove due to high zero-shot performance
+)
 
 LAUNCHER="python"
-# CIRR MSCOCO_i2t MSCOCO_t2i NIGHTS VisDial VisualNews_i2t VisualNews_t2i WebQA
-for subset in CIRR MSCOCO_i2t MSCOCO_t2i NIGHTS VisDial VisualNews_i2t VisualNews_t2i WebQA FashionIQ OVEN Wiki-SS-NQ EDIS; do
-  ulimit -n 8192 && ${LAUNCHER} hyperbolic/eval.py \
-    --model_name_or_path "$MODEL_NAME_OR_PATH" \
-    --bf16 \
-    --image_dir /home/thuy0050/mg61_scratch2/thuy0050/data/MMEB/MMEB-eval/image-tasks \
-    --subset_name "$subset" \
-    --per_device_eval_batch_size 256 \
-    --output_dir "$OUTPUT_DIR" \
-    --run_name "$EXP_NAME"
-done
+ulimit -n 8192 && ${LAUNCHER} hyperbolic/eval.py \
+  --model_name_or_path "$MODEL_NAME_OR_PATH" \
+  --image_dir /home/thuy0050/mg61_scratch2/thuy0050/data/MMEB/MMEB-eval/image-tasks \
+  --subset_name "${EVAL_SUBSETS[@]}" \
+  --output_dir "$OUTPUT_DIR" \
+  --run_name "$EXP_NAME"

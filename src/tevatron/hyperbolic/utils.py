@@ -200,7 +200,7 @@ def get_params_info(model):
     )
 
 
-def init(model_args_cls, data_args_cls, training_args_cls):
+def init(model_args_cls, data_args_cls, training_args_cls, verbose: bool = True):
     parser = HfArgumentParser((model_args_cls, data_args_cls, training_args_cls))  # type: ignore
 
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -229,19 +229,20 @@ def init(model_args_cls, data_args_cls, training_args_cls):
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
     )
-    logger.warning(
-        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-        training_args.local_rank,
-        training_args.device,
-        training_args.n_gpu,
-        bool(training_args.local_rank != -1),
-        training_args.fp16,
-    )
-    logger.info(
-        "\n##### Training/evaluation arguments #####\n %s\n", pformat(training_args)
-    )
-    logger.info("\n ##### Model arguments #####\n %s\n", pformat(model_args))
-    logger.info("\n ##### Data arguments #####\n %s\n", pformat(data_args))
+    if verbose:
+        logger.warning(
+            "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+            training_args.local_rank,
+            training_args.device,
+            training_args.n_gpu,
+            bool(training_args.local_rank != -1),
+            training_args.fp16,
+        )
+        logger.info(
+            "\n##### Training/evaluation arguments #####\n %s\n", pformat(training_args)
+        )
+        logger.info("\n ##### Model arguments #####\n %s\n", pformat(model_args))
+        logger.info("\n ##### Data arguments #####\n %s\n", pformat(data_args))
 
     set_seed(training_args.seed)
 

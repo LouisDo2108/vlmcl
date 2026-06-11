@@ -1,10 +1,12 @@
-from typing import Dict, Optional
+import os
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from tevatron.hyperbolic.arguments import ModelArguments, TrainingArguments
+from tevatron.hyperbolic.poincare import embed_sphere_to_ball, expmap0, project_to_ball
 from tevatron.hyperbolic.utils import print_master
 from torch import Tensor, nn
 from transformers import CLIPModel
@@ -150,6 +152,71 @@ class CLIPContrastiveModel(nn.Module):
             temperature=model_args.temperature,
         )
 
+    @staticmethod
+    def normalize_lora_paths(
+        lora_name_or_path: Union[str, List[str], None],
+    ) -> List[str]:
+        if not lora_name_or_path:
+            return []
+        if isinstance(lora_name_or_path, str):
+            return [lora_name_or_path]
+        return list(lora_name_or_path)
+
+    @classmethod
+    def _merge_lora_into_encoder(
+        cls,
+        encoder: CLIPModel,
+        adapter_path: str,
+        merge_coeff: float,
+    ) -> CLIPModel:
+        lora_config = LoraConfig.from_pretrained(adapter_path)
+        print_master(f"Merging LoRA from {adapter_path} (coeff={merge_coeff})")
+        setattr(
+            lora_config,
+            "lora_alpha",
+            int(lora_config.lora_alpha * merge_coeff),
+        )
+        lora_model = PeftModel.from_pretrained(
+            encoder,
+            adapter_path,
+            config=lora_config,
+        )
+        return lora_model.merge_and_unload()
+
+    @classmethod
+    def load_merged_adapters(cls, model_args: ModelArguments, **kwargs):
+        """
+        Load base CLIP and sequentially merge each LoRA checkpoint in
+        model_args.lora_name_or_path (in order).
+        """
+        print_master("-----START LOADING MERGED ADAPTERS-----")
+        adapter_paths = cls.normalize_lora_paths(model_args.lora_name_or_path)
+        if not adapter_paths:
+            raise ValueError("load_merged_adapters requires --lora_name_or_path.")
+
+        dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        hf_kwargs = {"torch_dtype": dtype, **kwargs}
+        merge_coeff = model_args.lora_merge_coeff
+
+        first_config = LoraConfig.from_pretrained(adapter_paths[0])
+        encoder = cls.load_clip_encoder(
+            first_config.base_model_name_or_path,
+            **hf_kwargs,
+        )
+        for ix, adapter_path in enumerate(adapter_paths):
+            if ix == len(adapter_paths) - 1:
+                merge_coeff = 1.0
+            encoder = cls._merge_lora_into_encoder(
+                encoder, adapter_path, merge_coeff
+            )
+
+        return cls(
+            encoder=encoder,
+            normalize=model_args.normalize,
+            temperature=model_args.temperature,
+        )
+        print_master("-----END LOADING MERGED ADAPTERS-----")
+
     @classmethod
     def load(cls, model_args: ModelArguments, **kwargs):
         """
@@ -159,17 +226,25 @@ class CLIPContrastiveModel(nn.Module):
         - build(lora=True): base from model_name_or_path + new LoRA adapters
         - load (PEFT checkpoint): base from adapter_config.base_model_name_or_path + adapter weights from checkpoint dir
 
-        After training, point both model_name_or_path and lora_name_or_path at
-        output_dir (trainer saves encoder/adapter there).
+        Pass multiple dirs via lora_name_or_path to merge them sequentially.
         """
+        print_master("-----START LOADING-----")
+        adapter_paths = cls.normalize_lora_paths(model_args.lora_name_or_path)
+        if len(adapter_paths) > 1:
+            return cls.load_merged_adapters(model_args, **kwargs)
+
         dtype = kwargs.pop("torch_dtype", torch.bfloat16)
         hf_kwargs = {"torch_dtype": dtype, **kwargs}
 
         # Adapter checkpoint: same dir as trainer.save_model (adapter_config + weights)
-        adapter_path = model_args.lora_name_or_path or model_args.model_name_or_path
+        adapter_path = (
+            adapter_paths[0]
+            if adapter_paths
+            else model_args.model_name_or_path
+        )
 
         lora_config = None
-        if model_args.lora or model_args.lora_name_or_path:
+        if model_args.lora or adapter_paths:
             try:
                 lora_config = LoraConfig.from_pretrained(adapter_path)
             except Exception as e:
@@ -186,10 +261,9 @@ class CLIPContrastiveModel(nn.Module):
             )
             print_master(f"Loading LoRA checkpoint from {adapter_path}")
 
-            if model_args.lora_merge_coeff != 1.0:
-                print_master(f"Merging LoRA with merge coefficient {model_args.lora_merge_coeff}")
-                setattr(lora_config, "lora_alpha", int(lora_config.lora_alpha * model_args.lora_merge_coeff))
-                print_master(f"lora_config.lora_alpha: {lora_config.lora_alpha}")
+            print_master(f"Merging LoRA with merge coefficient {model_args.lora_merge_coeff}")
+            setattr(lora_config, "lora_alpha", int(lora_config.lora_alpha * model_args.lora_merge_coeff))
+            print_master(f"lora_config.lora_alpha: {lora_config.lora_alpha}")
 
             lora_model = PeftModel.from_pretrained(
                 base_model,
@@ -205,6 +279,8 @@ class CLIPContrastiveModel(nn.Module):
                 **hf_kwargs,
             )
 
+        print_master("-----END LOADING-----")
+
         return cls(
             encoder=encoder,
             normalize=model_args.normalize,
@@ -216,15 +292,17 @@ class CLIPContrastiveModel(nn.Module):
         cls, model_args: ModelArguments, training_args: TrainingArguments = None, **kwargs
     ):
         """
-        Continual LoRA: load and merge a prior adapter via load(), then attach new LoRA.
+        Continual LoRA: sequentially merge prior adapter(s), then attach new LoRA.
         """
-        if not model_args.lora_name_or_path:
+        print_master("-----START LOADING MERGE BUILD-----")
+        
+        adapter_paths = cls.normalize_lora_paths(model_args.lora_name_or_path)
+        if not adapter_paths:
             raise ValueError("load_merge_build requires --lora_name_or_path.")
         if not model_args.lora:
             raise ValueError("load_merge_build requires --lora to initialize new adapters.")
 
-        merged_model = cls.load(model_args, **kwargs)
-        merged_model.peft_config = None # Reset PEFT config to avoid merge_and_unload issues
+        merged_model = cls.load_merged_adapters(model_args, **kwargs)
 
         lora_config = LoraConfig(
             r=model_args.lora_r,
@@ -242,7 +320,7 @@ class CLIPContrastiveModel(nn.Module):
         encoder = get_peft_model(merged_model.encoder, lora_config)
         print_master("Initialized new LoRA on merged encoder")
         print_master(f"Active adapters: {encoder.active_adapters}")
-
+        print_master("-----END LOADING MERGE BUILD-----")
         return cls(
             encoder=encoder,
             normalize=model_args.normalize,
@@ -342,3 +420,74 @@ class CCLIP(CLIPContrastiveModel):
         qry_reps = self.encode_input(qry)
         tgt_reps = self.encode_input(tgt)
         return self.project_ckc_from_clip_reps(qry_reps, tgt_reps)
+
+
+class HyperbolicCCLIP(CCLIP):
+    """
+    C-CLIP with CKC regularization in hyperbolic (Poincaré) space.
+
+    New features: linear projector -> expmap0.
+    Old cached sphere features: expmap0(α · y) at CKC time.
+    CKC similarity should use hyperbolic distance (see build_ckc_loss).
+    """
+
+    def __init__(
+        self,
+        *args,
+        curvature: float = 1.0,
+        old_tangent_scale: float = 1.0,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.curvature = curvature
+        self.old_tangent_scale = old_tangent_scale
+
+    @classmethod
+    def build(cls, model_args: ModelArguments, **kwargs):
+        dtype = kwargs.pop("torch_dtype", torch.bfloat16)
+        hf_kwargs = {"torch_dtype": dtype, **kwargs}
+        base_model = cls.load_clip_encoder(model_args.model_name_or_path, **hf_kwargs)
+
+        if model_args.lora:
+            lora_config = LoraConfig(
+                r=model_args.lora_r,
+                lora_alpha=model_args.lora_alpha,
+                target_modules=(
+                    model_args.lora_target_modules
+                    if model_args.lora_target_modules == "all-linear"
+                    else model_args.lora_target_modules.split(",")
+                ),
+                lora_dropout=model_args.lora_dropout,
+                init_lora_weights="gaussian",
+                use_dora=False,
+                inference_mode=False,
+            )
+            base_model = get_peft_model(base_model, lora_config)
+
+        return cls(
+            encoder=base_model,
+            normalize=model_args.normalize,
+            temperature=model_args.temperature,
+            curvature=model_args.curvature,
+            old_tangent_scale=model_args.old_tangent_scale,
+        )
+
+    def to_hyperbolic(self, reps: Tensor) -> Tensor:
+        reps = project_to_ball(
+            expmap0(reps, c=self.curvature),
+            c=self.curvature,
+        )
+        return reps
+
+    def _project(self, reps: Tensor) -> Tensor:
+        reps = self.cclip_projector(reps)
+        if self.normalize:
+            reps = self.to_hyperbolic(reps)
+        return reps
+
+    def embed_old_ckc_reps(self, reps: Tensor) -> Tensor:
+        return embed_sphere_to_ball(
+            reps,
+            scale=self.old_tangent_scale,
+            c=self.curvature,
+        )

@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from tevatron.hyperbolic.poincare import poincare_distance
 from torch import Tensor
 
 
@@ -105,6 +106,70 @@ class DistributedContrastiveLoss(SimpleContrastiveLoss):
         return torch.cat(gathered, dim=0)
 
 
+class HyperbolicContrastiveLoss(SimpleContrastiveLoss):
+    """Contrastive loss with logits = -Poincaré distance / temperature."""
+
+    def __init__(
+        self,
+        temperature: float = 0.02,
+        bidirectional: bool = True,
+        curvature: float = 1.0,
+    ):
+        super().__init__(temperature=temperature, bidirectional=bidirectional)
+        self.curvature = curvature
+
+    def _directional_loss(
+        self,
+        x: Tensor,
+        y: Tensor,
+        target: Tensor | None = None,
+        reduction: str = "mean",
+    ) -> Tensor:
+        if target is None:
+            target = _diagonal_targets(x, y)
+        if y.dtype != x.dtype:
+            y = y.to(dtype=x.dtype)
+        logits = -poincare_distance(x, y, c=self.curvature)
+        return F.cross_entropy(logits / self.temperature, target, reduction=reduction)
+
+
+class DistributedHyperbolicContrastiveLoss(HyperbolicContrastiveLoss):
+    def __init__(
+        self,
+        n_target: int = 0,
+        scale_loss: bool = True,
+        temperature: float = 0.02,
+        bidirectional: bool = True,
+        curvature: float = 1.0,
+    ):
+        assert dist.is_initialized(), (
+            "Distributed training has not been properly initialized."
+        )
+        super().__init__(
+            temperature=temperature,
+            bidirectional=bidirectional,
+            curvature=curvature,
+        )
+        self.word_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+        self.scale_loss = scale_loss
+
+    def __call__(self, x: Tensor, y: Tensor, **kwargs):
+        dist_x = self.gather_tensor(x)
+        dist_y = self.gather_tensor(y)
+        components = self.loss_components(dist_x, dist_y, **kwargs)
+        if self.scale_loss:
+            components = {k: v * self.word_size for k, v in components.items()}
+        self.losses = self._round_losses(components)
+        return components["loss"]
+
+    def gather_tensor(self, t):
+        gathered = [torch.empty_like(t) for _ in range(self.word_size)]
+        dist.all_gather(gathered, t)
+        gathered[self.rank] = t
+        return torch.cat(gathered, dim=0)
+
+
 def build_contrastive_loss(
     *,
     is_ddp: bool,
@@ -114,3 +179,30 @@ def build_contrastive_loss(
     """Factory used by CLIP and CCLIP trainers."""
     cls = DistributedContrastiveLoss if is_ddp else SimpleContrastiveLoss
     return cls(temperature=temperature, bidirectional=bidirectional)
+
+
+def build_ckc_loss(
+    *,
+    is_ddp: bool,
+    temperature: float,
+    bidirectional: bool,
+    hyperbolic: bool = False,
+    curvature: float = 1.0,
+) -> SimpleContrastiveLoss:
+    """CKC loss factory: Euclidean dot product or hyperbolic distance."""
+    if hyperbolic:
+        cls = (
+            DistributedHyperbolicContrastiveLoss
+            if is_ddp
+            else HyperbolicContrastiveLoss
+        )
+        return cls(
+            temperature=temperature,
+            bidirectional=bidirectional,
+            curvature=curvature,
+        )
+    return build_contrastive_loss(
+        is_ddp=is_ddp,
+        temperature=temperature,
+        bidirectional=bidirectional,
+    )
